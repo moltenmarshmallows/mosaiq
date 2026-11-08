@@ -69,6 +69,7 @@ jobs:
           expected-allowed-origins: ${{ vars.ALLOWED_ORIGINS_STAGING }}
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN_STAGING }}
           cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID_STAGING }}
+          expected-cloudflare-account-id: 5b594173256386996fe1e03fd5cea3f8
           deploy-smoke-auth-token: ${{ secrets.STAGING_DEPLOY_SMOKE_AUTH_TOKEN }}
           web-deploy-args: --config wrangler.workers.toml
           git-sha: ${{ github.sha }}
@@ -108,6 +109,7 @@ jobs:
           expected-allowed-origins: ${{ vars.ALLOWED_ORIGINS_PROD }}
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN_PROD }}
           cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID_PROD }}
+          expected-cloudflare-account-id: 5b594173256386996fe1e03fd5cea3f8
           deploy-smoke-auth-token: ${{ secrets.PROD_DEPLOY_SMOKE_AUTH_TOKEN }}
           web-deploy-args: --config wrangler.workers.toml --env production
           git-sha: ${{ github.sha }}
