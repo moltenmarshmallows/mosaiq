@@ -69,12 +69,6 @@
     "tailwindcss": {
       "postcss-selector-parser": "^6.1.5"
     },
-    "nx": {
-      "minimatch": "^11.0.5"
-    },
-    "@nx/devkit": {
-      "minimatch": "^11.0.5"
-    },
     "eslint": {
       "minimatch": "^11.0.5"
     },
