@@ -31,7 +31,7 @@ Do not use GTM for PostHog or core product analytics — see [analytics-observab
 
 ## Flagship allowlist (replaces `VMP_FEATURES`)
 
-Per-feature boolean flags in the Flagship app (staging: `e1bb7ed4-8309-458f-9f60-cb61f881685a`). Local override: `FLAGSHIP_DEV_OVERRIDE` CSV in `.dev.vars` only.
+Per-feature boolean flags in the Flagship app (staging: `b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5`). Local override: `FLAGSHIP_DEV_OVERRIDE` CSV in `.dev.vars` only.
 
 Catalog: `packages/shared/src/deploymentFeatures.ts`. Web hydrates `GET /api/deployment-features` into `useDeploymentFeatures` with per-id state:
 

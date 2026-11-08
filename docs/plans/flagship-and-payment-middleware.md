@@ -75,7 +75,7 @@ Local `wrangler dev` evaluates against the **live** Flagship app (no local flag 
 | ID | Decision |
 |----|----------|
 | **A1** | Runtime Flagship gates; always register web modules; no-op when flag off. Slim tree-shaking is a later optional profile, not `VMP_FEATURES`. |
-| **A2** | **One Flagship app for staging** — app id `e1bb7ed4-8309-458f-9f60-cb61f881685a` (dashboard name likely `vmp`). Wired as `FLAGS` in `packages/api/wrangler.json`. Add a prod app later if needed. Enable per-feature flags **before** Phase B cutover. |
+| **A2** | **One Flagship app for staging** — app id `b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5` (dashboard name likely `vmp`). Wired as `FLAGS` in `packages/api/wrangler.json`. Add a prod app later if needed. Enable per-feature flags **before** Phase B cutover. |
 | **A3** | Flagship on **API only**; web hydrates via deployment-features / bootstrap endpoint. |
 | **A4** | Keep `gtm` as a Flagship infra flag. |
 | **A5** | `FlagEvaluator` + mock for tests; optional `FLAGSHIP_DEV_OVERRIDE` in `.dev.vars` only (not named `VMP_FEATURES`). |
@@ -96,15 +96,17 @@ Local `wrangler dev` evaluates against the **live** Flagship app (no local flag 
 
 | Field | Value |
 |-------|--------|
-| Account | `8298ebe2fc93e55a92f8bc5727d5f331` |
-| App ID | `e1bb7ed4-8309-458f-9f60-cb61f881685a` |
-| Dashboard | [Flagship app overview](https://dash.cloudflare.com/8298ebe2fc93e55a92f8bc5727d5f331/flagship/applications/e1bb7ed4-8309-458f-9f60-cb61f881685a/overview) |
-| Worker binding | `FLAGS` in `packages/api/wrangler.json` |
+| Account | `5b594173256386996fe1e03fd5cea3f8` |
+| App ID | `b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5` |
+| Dashboard | [Flagship app overview](https://dash.cloudflare.com/5b594173256386996fe1e03fd5cea3f8/flagship/applications/b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5/overview) |
+| Worker binding | `FLAGS` in `packages/api/wrangler.json` + `packages/billing/wrangler.json` |
+
+Re-created on the Mosaiq account 2026-11-08 (the original `vmp` app `e1bb7ed4-8309-458f-9f60-cb61f881685a` stayed on the legacy `tojemoc` account `8298ebe2fc93e55a92f8bc5727d5f331`; flag states were mirrored 1:1, including disabled `gtm`/`isic-api`).
 
 **Preferred flag model (matches original success criteria — identical names):**
 
 ```bash
-APP_ID=e1bb7ed4-8309-458f-9f60-cb61f881685a
+APP_ID=b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5
 for key in gtm posthog analytics cms pwa push pills newsletter einvoicing \
   legacy_migration rss_podcast rss_podcast_preview_mp3 payments deno_replication; do
   npx wrangler flagship flags create "$APP_ID" "$key"   # boolean, default off
@@ -235,7 +237,7 @@ Constraints:
 1. [x] `packages/api/src/infraFlags.ts` — Flagship binding → default `false`; temporary fallback to `VMP_FEATURES`; `FLAGSHIP_DEV_OVERRIDE` for local.
 2. [x] Route guards / admin manifest evaluation **async**.
 3. [x] Unit tests with mock `FLAGS` binding.
-4. [x] Binding `FLAGS` → app `e1bb7ed4-8309-458f-9f60-cb61f881685a` (+ `account_id` for Wrangler).
+4. [x] Binding `FLAGS` → app `b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5` (+ `account_id` for Wrangler).
 5. [x] Per-feature boolean flags created; staging allowlist `default_variation=on` (except `gtm` / `isic-api`).
 6. [x] `VMP_FEATURES` removed in Phase B (same PR as A–F).
 
