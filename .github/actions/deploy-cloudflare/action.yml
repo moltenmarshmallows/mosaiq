@@ -19,6 +19,9 @@ inputs:
   cloudflare-account-id:
     required: true
     description: Cloudflare account ID for this environment.
+  expected-cloudflare-account-id:
+    required: true
+    description: Expected Cloudflare account ID for the deployment target.
   deploy-smoke-auth-token:
     required: false
     default: ''
@@ -97,12 +100,21 @@ runs:
         EXPECTED_ALLOWED_ORIGINS: ${{ inputs.expected-allowed-origins }}
         CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare-api-token }}
         CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+        EXPECTED_CLOUDFLARE_ACCOUNT_ID: ${{ inputs.expected-cloudflare-account-id }}
       run: |
         test -n "$API_BASE_URL" || (echo "Missing API base URL for ${{ inputs.deploy-tier }}" && exit 1)
         test -n "$FRONTEND_URL" || (echo "Missing frontend URL for ${{ inputs.deploy-tier }}" && exit 1)
         test -n "$EXPECTED_ALLOWED_ORIGINS" || (echo "Missing allowed origins for ${{ inputs.deploy-tier }}" && exit 1)
         test -n "$CLOUDFLARE_API_TOKEN" || (echo "Missing Cloudflare API token for ${{ inputs.deploy-tier }}" && exit 1)
         test -n "$CLOUDFLARE_ACCOUNT_ID" || (echo "Missing Cloudflare account ID for ${{ inputs.deploy-tier }}" && exit 1)
+        if [[ ! "$CLOUDFLARE_ACCOUNT_ID" =~ ^[[:xdigit:]]{32}$ ]]; then
+          echo "::error::Cloudflare account ID for ${{ inputs.deploy-tier }} must be 32 hexadecimal characters."
+          exit 1
+        fi
+        if [[ "$CLOUDFLARE_ACCOUNT_ID" != "$EXPECTED_CLOUDFLARE_ACCOUNT_ID" ]]; then
+          echo "::error::Cloudflare account ID for ${{ inputs.deploy-tier }} does not match the expected Mosaiq account."
+          exit 1
+        fi
         echo "Deploy tier: ${{ inputs.deploy-tier }}"
         echo "API base URL: $API_BASE_URL"
         echo "Frontend URL: $FRONTEND_URL"
