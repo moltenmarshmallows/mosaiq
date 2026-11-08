@@ -13,7 +13,7 @@
   "flagship": [
     {
       "binding": "FLAGS",
-      "app_id": "e1bb7ed4-8309-458f-9f60-cb61f881685a"
+      "app_id": "b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5"
     }
   ],
   "vars": {
@@ -47,7 +47,7 @@
       "flagship": [
         {
           "binding": "FLAGS",
-          "app_id": "e1bb7ed4-8309-458f-9f60-cb61f881685a"
+          "app_id": "b84a51be-8c8c-4374-8ac5-4fb1f97bf0e5"
         }
       ],
       "vars": {
