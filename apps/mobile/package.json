@@ -18,7 +18,19 @@
     "react-native-reanimated": "4.7.1",
     "react-native-worklets": "0.13.1",
     "decode-uri-component": ">=0.5.0",
-    "uuid": ">=11.1.1"
+    "uuid": ">=11.1.1",
+    "shell-quote": "^1.11.0",
+    "compression": "^1.8.2",
+    "@expo/cli": {
+      "glob": "^14.0.2"
+    },
+    "@expo/fingerprint": {
+      "glob": "^14.0.2",
+      "minimatch": "^11.0.5"
+    },
+    "@react-native-tvos/config-tv": {
+      "glob": "^14.0.2"
+    }
   },
   "dependencies": {
     "@dr.pogodin/react-native-fs": "^2.40.3",

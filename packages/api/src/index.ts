@@ -6,7 +6,7 @@
  * the HttpOnly refresh-token cookie to be sent cross-origin).
  */
 
-import type { DurableObjectState, ExecutionContext } from '@cloudflare/workers-types';
+import type { DurableObjectState } from '@cloudflare/workers-types';
 import * as Sentry from '@sentry/cloudflare';
 import type { CloudflareOptions } from '@sentry/cloudflare';
 import {

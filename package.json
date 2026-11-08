@@ -47,7 +47,7 @@
   },
   "overrides": {
     "esbuild": "0.28.2",
-    "serialize-javascript": ">=7.0.3",
+    "serialize-javascript": ">=7.1.3",
     "brace-expansion": ">=5.0.12",
     "better-sqlite3": "^13.0.0",
     "tmp": ">=0.2.6",
@@ -57,7 +57,39 @@
     "axios": "^1.20.0",
     "dompurify": "3.4.17",
     "undici": "8.12.4",
-    "smol-toml": ">=1.7.1",
+    "smol-toml": ">=1.9.1",
+    "zod": "^4.6.6",
+    "deepmerge": "4.1.2",
+    "fast-uri": "^3.1.9",
+    "happy-dom": "^21.0.4",
+    "postcss-selector-parser": "^7.1.6",
+    "postcss-nested": {
+      "postcss-selector-parser": "^6.1.5"
+    },
+    "tailwindcss": {
+      "postcss-selector-parser": "^6.1.5"
+    },
+    "eslint": {
+      "minimatch": "^11.0.5"
+    },
+    "@eslint/config-array": {
+      "minimatch": "^11.0.5"
+    },
+    "readdir-glob": {
+      "minimatch": "^11.0.5"
+    },
+    "@sentry/bundler-plugins": {
+      "glob": "^14.0.2"
+    },
+    "@vercel/nft": {
+      "glob": "^14.0.2"
+    },
+    "workbox-build": {
+      "glob": "^14.0.2"
+    },
+    "miniflare": {
+      "sharp": "0.35.5"
+    },
     "nuxt": {
       "undici": "8.12.4"
     }
