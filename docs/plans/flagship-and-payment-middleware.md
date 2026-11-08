@@ -103,6 +103,8 @@ Local `wrangler dev` evaluates against the **live** Flagship app (no local flag 
 
 Re-created on the Mosaiq account 2026-11-08 (the original `vmp` app `e1bb7ed4-8309-458f-9f60-cb61f881685a` stayed on the legacy `tojemoc` account `8298ebe2fc93e55a92f8bc5727d5f331`; flag states were mirrored 1:1, including disabled `gtm`/`isic-api`).
 
+**One app serves all tiers.** `wrangler.json` binds this same `app_id` for staging (top-level) **and** `env.production` on both API and billing, and evaluation passes no environment context (`getBooleanValue(id, false)` — see `packages/shared/src/infraFlags.ts`). Flag changes are therefore global: flipping e.g. `payments` for staging also flips production checkout. Create a dedicated prod app before using a flag as a staging-only kill switch (A2: "add a prod app later if needed").
+
 **Preferred flag model (matches original success criteria — identical names):**
 
 ```bash
