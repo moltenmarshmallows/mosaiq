@@ -688,6 +688,8 @@ jobs:
           files: release/ios/*
 
       - name: Upload Android APKs to GitHub Release
+        id: android_upload
+        continue-on-error: true
         if: >-
           ${{
             needs.build-android.result == 'success'
@@ -765,3 +767,9 @@ jobs:
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+
+      - name: Report Android APK upload failure
+        if: ${{ steps.android_upload.outcome == 'failure' }}
+        run: |
+          echo "::error::Android APK upload failed; iOS release and GitHub Pages were published. Retry the workflow to upload the APKs."
+          exit 1
