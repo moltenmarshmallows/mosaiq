@@ -490,7 +490,7 @@ jobs:
           if-no-files-found: error
 
   publish-ios-release:
-    # Wait for Android phone + TV jobs when they ran so Pages can publish nightly.link APK URLs.
+    # Wait for Android phone + TV jobs when they ran so Pages and GitHub Releases can include APKs.
     # Android failure/skip must not block the iOS Release + AltStore Pages publish.
     if: >-
       ${{
@@ -545,13 +545,38 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ios-ipa
-          path: ./artifacts
+          path: ./artifacts/ios
+
+      - name: Download Android phone APK artifact
+        id: android_phone_download
+        continue-on-error: true
+        if: ${{ needs.build-android.result == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mobile-android-apk
+          path: ./artifacts/android-phone
+
+      - name: Download Android TV APK artifact
+        id: android_tv_download
+        continue-on-error: true
+        if: ${{ needs.build-android-tv.result == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mobile-android-tv-apk
+          path: ./artifacts/android-tv
 
       - name: Stage release files
         run: |
           mkdir -p release/ios
-          find ./artifacts -name "*.ipa" -exec cp {} release/ios/ \;
+          mkdir -p release/android
+          find ./artifacts/ios -name "*.ipa" -exec cp {} release/ios/ \;
           ls -la release/ios/
+          for artifact_dir in ./artifacts/android-phone ./artifacts/android-tv; do
+            if [ -d "$artifact_dir" ]; then
+              find "$artifact_dir" -name "*.apk" -exec cp {} release/android/ \;
+            fi
+          done
+          ls -la release/android/
 
       - name: Reserve release tag (atomic)
         id: reserve
@@ -666,6 +691,27 @@ jobs:
           prerelease: ${{ inputs.flavor != 'release' }}
           files: release/ios/*
 
+      - name: Upload Android APKs to GitHub Release
+        id: android_upload
+        continue-on-error: true
+        if: >-
+          ${{
+            needs.build-android.result == 'success'
+            || needs.build-android-tv.result == 'success'
+          }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build-ios.outputs.flavor_label }}-v${{ needs.build-ios.outputs.version_name }}-build${{ needs.build-ios.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apk_files=(release/android/*.apk)
+          if ((${#apk_files[@]} == 0)); then
+            echo "::error::Android build succeeded but no APKs were staged for release."
+            exit 1
+          fi
+          gh release upload "$TAG" "${apk_files[@]}" --clobber
+
       - name: Delete unused tag after failed release
         if: ${{ failure() && steps.release.outcome == 'failure' && steps.reserve.outputs.created == 'true' }}
         env:
@@ -725,3 +771,33 @@ jobs:
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+
+      - name: Report Android APK upload failure
+        if: >-
+          ${{
+            steps.android_phone_download.outcome == 'failure'
+            || steps.android_tv_download.outcome == 'failure'
+            || steps.android_upload.outcome == 'failure'
+          }}
+        env:
+          ANDROID_PHONE_DOWNLOAD_RESULT: ${{ steps.android_phone_download.outcome }}
+          ANDROID_TV_DOWNLOAD_RESULT: ${{ steps.android_tv_download.outcome }}
+          ANDROID_UPLOAD_RESULT: ${{ steps.android_upload.outcome }}
+        run: |
+          failed=false
+          if [ "$ANDROID_PHONE_DOWNLOAD_RESULT" = "failure" ]; then
+            echo "::error::Android phone/tablet APK download failed; iOS release and GitHub Pages were published."
+            failed=true
+          fi
+          if [ "$ANDROID_TV_DOWNLOAD_RESULT" = "failure" ]; then
+            echo "::error::Android TV APK download failed; iOS release and GitHub Pages were published."
+            failed=true
+          fi
+          if [ "$ANDROID_UPLOAD_RESULT" = "failure" ]; then
+            echo "::error::Android APK upload failed; iOS release and GitHub Pages were published."
+            failed=true
+          fi
+          if [ "$failed" = true ]; then
+            echo "Retry the workflow to complete Android APK publishing."
+            exit 1
+          fi
