@@ -70,13 +70,13 @@
       "postcss-selector-parser": "^6.1.5"
     },
     "eslint": {
-      "minimatch": "^11.0.5"
+      "minimatch": "^11.0.0"
     },
     "@eslint/config-array": {
-      "minimatch": "^11.0.5"
+      "minimatch": "^11.0.0"
     },
     "readdir-glob": {
-      "minimatch": "^11.0.5"
+      "minimatch": "^11.0.0"
     },
     "@sentry/bundler-plugins": {
       "glob": "^14.0.2"
