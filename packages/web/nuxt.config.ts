@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { AUTH_URL_CREDENTIAL_PARAMS } from './utils/authUrlCredentials';
 import { readBuildInfoDefaults } from './utils/buildInfoSource';
 import { loadMonorepoRootEnv } from './utils/loadMonorepoRootEnv';
@@ -152,6 +153,15 @@ export default defineNuxtConfig({
     : {}),
 
   nitro: {
+    alias: {
+      // posthog-node dynamically imports @react-email/render for
+      // `client.emails.send({ react })`, which this app never uses. The
+      // cloudflare-module preset forbids externals, so resolve the optional
+      // import to a throwing stub instead of bundling react/react-dom.
+      '@react-email/render': fileURLToPath(
+        new URL('./server/stubs/react-email-render.ts', import.meta.url),
+      ),
+    },
     // Workbox navigateFallback requires "/" in the precache manifest (SSR builds).
     prerender: {
       routes: ['/'],
