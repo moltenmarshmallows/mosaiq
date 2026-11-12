@@ -30,12 +30,12 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
-    "@nx/nuxt": "24.0.5",
-    "@nx/vite": "24.0.5",
+    "@nx/nuxt": "24.0.6",
+    "@nx/vite": "24.0.6",
     "@vue/language-core": "^3.3.11",
     "knip": "^6.37.0",
     "nuxt": "^4.5.2",
-    "nx": "24.0.5",
+    "nx": "24.0.6",
     "ws": "8.22.2",
     "@typescript/native": "npm:typescript@^7.0.2",
     "typescript": "npm:@typescript/typescript6@^6.0.2"
@@ -59,15 +59,15 @@
     "undici": "8.12.4",
     "smol-toml": ">=1.9.1",
     "zod": "^4.6.6",
-    "deepmerge": "4.1.2",
+    "deepmerge": "4.3.1",
     "fast-uri": "^3.1.9",
     "happy-dom": "^21.0.4",
     "postcss-selector-parser": "^7.1.6",
     "postcss-nested": {
-      "postcss-selector-parser": "^6.1.5"
+      "postcss-selector-parser": "^6.1.6"
     },
     "tailwindcss": {
-      "postcss-selector-parser": "^6.1.5"
+      "postcss-selector-parser": "^6.1.6"
     },
     "eslint": {
       "minimatch": "^11.0.5"
