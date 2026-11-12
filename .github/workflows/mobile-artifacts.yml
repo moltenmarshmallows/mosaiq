@@ -548,6 +548,8 @@ jobs:
           path: ./artifacts/ios
 
       - name: Download Android phone APK artifact
+        id: android_phone_download
+        continue-on-error: true
         if: ${{ needs.build-android.result == 'success' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -555,6 +557,8 @@ jobs:
           path: ./artifacts/android-phone
 
       - name: Download Android TV APK artifact
+        id: android_tv_download
+        continue-on-error: true
         if: ${{ needs.build-android-tv.result == 'success' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -769,7 +773,31 @@ jobs:
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
 
       - name: Report Android APK upload failure
-        if: ${{ steps.android_upload.outcome == 'failure' }}
+        if: >-
+          ${{
+            steps.android_phone_download.outcome == 'failure'
+            || steps.android_tv_download.outcome == 'failure'
+            || steps.android_upload.outcome == 'failure'
+          }}
+        env:
+          ANDROID_PHONE_DOWNLOAD_RESULT: ${{ steps.android_phone_download.outcome }}
+          ANDROID_TV_DOWNLOAD_RESULT: ${{ steps.android_tv_download.outcome }}
+          ANDROID_UPLOAD_RESULT: ${{ steps.android_upload.outcome }}
         run: |
-          echo "::error::Android APK upload failed; iOS release and GitHub Pages were published. Retry the workflow to upload the APKs."
-          exit 1
+          failed=false
+          if [ "$ANDROID_PHONE_DOWNLOAD_RESULT" = "failure" ]; then
+            echo "::error::Android phone/tablet APK download failed; iOS release and GitHub Pages were published."
+            failed=true
+          fi
+          if [ "$ANDROID_TV_DOWNLOAD_RESULT" = "failure" ]; then
+            echo "::error::Android TV APK download failed; iOS release and GitHub Pages were published."
+            failed=true
+          fi
+          if [ "$ANDROID_UPLOAD_RESULT" = "failure" ]; then
+            echo "::error::Android APK upload failed; iOS release and GitHub Pages were published."
+            failed=true
+          fi
+          if [ "$failed" = true ]; then
+            echo "Retry the workflow to complete Android APK publishing."
+            exit 1
+          fi
