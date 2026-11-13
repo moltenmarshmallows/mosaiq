@@ -52,6 +52,26 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/generate-altstore-source.py
 
+      - name: Sync permissions from the selected published IPA
+        run: |
+          set -euo pipefail
+          ipa_url="$(python3 -c 'import json; print(json.load(open("docs/altstore-source.json"))["apps"][0]["versions"][0]["downloadURL"])')"
+          printf '%s\n' "$ipa_url" > "$RUNNER_TEMP/published-ipa-url"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/published.ipa" "$ipa_url"
+          python3 scripts/sync-altstore-permissions.py \
+            "$RUNNER_TEMP/published.ipa" --source docs/altstore-source.meta.json
+
+      - name: Regenerate AltStore source with synchronized permissions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-altstore-source.py
+          ipa_url="$(python3 -c 'import json; print(json.load(open("docs/altstore-source.json"))["apps"][0]["versions"][0]["downloadURL"])')"
+          test "$ipa_url" = "$(cat "$RUNNER_TEMP/published-ipa-url")"
+          python3 scripts/sync-altstore-permissions.py \
+            "$RUNNER_TEMP/published.ipa" --source docs/altstore-source.json --check
+
       - name: Build Pages site (install page + nightly.link downloads.json)
         env:
           GITHUB_TOKEN: ${{ github.token }}

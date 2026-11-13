@@ -1,6 +1,7 @@
 import json
 import plistlib
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -32,6 +33,25 @@ INFO = {
 }
 
 
+def signed_executable(entitlements: dict, *, endian: str = "<", wide: bool = True) -> bytes:
+    """Minimal Mach-O fixture with an indexed signature and unrelated XML."""
+    unrelated = plistlib.dumps({"unrelated.plist.key": True})
+    payload = plistlib.dumps(entitlements)
+    blob = struct.pack(">II", 0xFADE7171, 8 + len(payload)) + payload
+    # Include a second plist inside a non-entitlement slot as well.
+    other = struct.pack(">II", 0xFADE7171, 8 + len(unrelated)) + unrelated
+    signature = (struct.pack(">III", 0xFADE0CC0, 28 + len(blob) + len(other), 2)
+                 + struct.pack(">II", 5, 28)
+                 + struct.pack(">II", 0x10000, 28 + len(blob)) + blob + other)
+    header = struct.pack(endian + "7I", 0xFEEDFACF if wide else 0xFEEDFACE,
+                         0, 0, 2, 1, 16, 0)
+    if wide:
+        header += struct.pack(endian + "I", 0)
+    command = struct.pack(endian + "4I", 0x1D, 16,
+                          len(header) + 16 + len(unrelated), len(signature))
+    return header + command + unrelated + signature
+
+
 class SyncAltStorePermissionsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -43,12 +63,8 @@ class SyncAltStorePermissionsTests(unittest.TestCase):
                 "Payload/Example.app/Info.plist",
                 plistlib.dumps(INFO, fmt=plistlib.FMT_XML),
             )
-            embedded_entitlements = plistlib.dumps(
-                DECLARED_ENTITLEMENTS, fmt=plistlib.FMT_XML
-            )
             archive.writestr(
-                "Payload/Example.app/Example",
-                b"fake Mach-O prefix\x00" + embedded_entitlements + b"\x00suffix",
+                "Payload/Example.app/Example", signed_executable(DECLARED_ENTITLEMENTS)
             )
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -175,6 +191,59 @@ class SyncAltStorePermissionsTests(unittest.TestCase):
         self.assertEqual(
             source["app"]["appPermissions"]["entitlements"], ["keep.me"]
         )
+
+    def test_extension_entitlements_are_merged_and_main_bundle_is_selected(self) -> None:
+        with zipfile.ZipFile(self.ipa, "a") as archive:
+            archive.writestr("Payload/Example.app/PlugIns/Share.appex/Info.plist",
+                             plistlib.dumps({"CFBundleIdentifier": BUNDLE_ID + ".share",
+                                             "CFBundleExecutable": "Share"}))
+            archive.writestr("Payload/Example.app/PlugIns/Share.appex/Share",
+                             signed_executable({"extension.only": True,
+                                                **SIGNING_ENTITLEMENTS}))
+        source = self.write_source({"apps": [
+            {"bundleIdentifier": BUNDLE_ID + ".share"},
+            {"bundleIdentifier": BUNDLE_ID}]})
+        result = self.run_cli("--source", str(source))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        apps = json.loads(source.read_text())["apps"]
+        self.assertNotIn("appPermissions", apps[0])
+        self.assertEqual(apps[1]["appPermissions"]["entitlements"], [
+            "com.apple.developer.associated-domains",
+            "com.apple.developer.networking.networkextension", "extension.only"])
+        self.assertEqual(self.run_cli("--source", str(source), "--check").returncode, 0)
+
+    def test_macho_variants_and_unsigned_binary(self) -> None:
+        for endian in ("<", ">"):
+            for wide in (False, True):
+                with self.subTest(endian=endian, wide=wide):
+                    executable = signed_executable(DECLARED_ENTITLEMENTS,
+                                                   endian=endian, wide=wide)
+                    self.rewrite_executable(executable)
+                    result = self.run_cli("--print-app-permissions")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(json.loads(result.stdout)["entitlements"]), 2)
+        self.rewrite_executable(struct.pack("<8I", 0xFEEDFACF, 0, 0, 2, 0, 0, 0, 0))
+        result = self.run_cli("--print-app-permissions")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["entitlements"], [])
+
+    def rewrite_executable(self, executable: bytes) -> None:
+        with zipfile.ZipFile(self.ipa, "w") as archive:
+            archive.writestr("Payload/Example.app/Info.plist", plistlib.dumps(INFO))
+            archive.writestr("Payload/Example.app/Example", executable)
+
+    def test_fat_binary_and_truncated_signature(self) -> None:
+        executable = signed_executable(DECLARED_ENTITLEMENTS)
+        fat = (struct.pack(">II", 0xCAFEBABE, 1)
+               + struct.pack(">5I", 0, 0, 28, len(executable), 0) + executable)
+        self.rewrite_executable(fat)
+        result = self.run_cli("--print-app-permissions")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["entitlements"]), 2)
+        self.rewrite_executable(executable[:-1])
+        result = self.run_cli("--print-app-permissions")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("truncated", result.stderr)
 
     def test_rejects_invalid_ipa_and_missing_bundle_id(self) -> None:
         self.ipa.write_bytes(b"not a zip archive")

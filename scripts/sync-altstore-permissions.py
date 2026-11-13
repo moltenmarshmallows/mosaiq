@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import plistlib
-import re
+import struct
 import stat
 import sys
 import tempfile
@@ -68,21 +68,72 @@ def _find_main_app(archive: zipfile.ZipFile) -> tuple[str, dict]:
 
 
 def _extract_entitlements(executable: bytes) -> list[str]:
+    """Read CSSLOT_ENTITLEMENTS from LC_CODE_SIGNATURE (including fat binaries)."""
     entitlements: set[str] = set()
-    for match in re.finditer(rb"<plist(?:\s[^>]*)?>", executable):
-        end = executable.find(b"</plist>", match.end())
-        if end < 0:
-            continue
-        try:
-            value = plistlib.loads(executable[match.start() : end + len(b"</plist>")])
-        except (plistlib.InvalidFileException, ValueError, TypeError):
-            continue
-        if isinstance(value, dict):
-            entitlements.update(
-                key
-                for key in value
-                if isinstance(key, str) and key not in SIGNING_ENTITLEMENTS
-            )
+
+    def unpack(fmt: str, data: bytes, offset: int) -> tuple:
+        if offset < 0 or offset + struct.calcsize(fmt) > len(data):
+            raise ValueError("invalid code signature: truncated structure")
+        return struct.unpack_from(fmt, data, offset)
+
+    def parse(data: bytes, *, allow_fat: bool = True) -> None:
+        magic = data[:4]
+        fat = {b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
+               b"\xca\xfe\xba\xbf": (">", True), b"\xbf\xba\xfe\xca": ("<", True)}
+        if magic in fat and allow_fat:
+            endian, wide = fat[magic]
+            count, = unpack(endian + "I", data, 4)
+            table_end = 8 + count * (32 if wide else 20)
+            if table_end > len(data):
+                raise ValueError("invalid Mach-O: truncated architecture table")
+            for index in range(count):
+                entry = 8 + index * (32 if wide else 20)
+                offset, size = unpack(endian + ("QQ" if wide else "II"), data, entry + 8)
+                if offset < table_end or offset + size > len(data):
+                    raise ValueError("invalid Mach-O: truncated architecture")
+                parse(data[offset:offset + size], allow_fat=False)
+            return
+        formats = {b"\xce\xfa\xed\xfe": ("<", 28), b"\xcf\xfa\xed\xfe": ("<", 32),
+                   b"\xfe\xed\xfa\xce": (">", 28), b"\xfe\xed\xfa\xcf": (">", 32)}
+        if magic not in formats:
+            raise ValueError("invalid Mach-O executable")
+        endian, cursor = formats[magic]
+        count, command_size = unpack(endian + "II", data, 16)
+        commands_end = cursor + command_size
+        if commands_end > len(data):
+            raise ValueError("invalid Mach-O: truncated load commands")
+        for _ in range(count):
+            if cursor + 8 > commands_end:
+                raise ValueError("invalid Mach-O: truncated load command")
+            command, size = unpack(endian + "II", data, cursor)
+            if size < 8 or cursor + size > commands_end:
+                raise ValueError("invalid Mach-O load command")
+            if command == 0x1D:  # LC_CODE_SIGNATURE
+                if size < 16:
+                    raise ValueError("invalid LC_CODE_SIGNATURE")
+                offset, length = unpack(endian + "II", data, cursor + 8)
+                if offset + length > len(data):
+                    raise ValueError("invalid code signature: truncated data")
+                signature = data[offset:offset + length]
+                sig_magic, sig_length, slots = unpack(">III", signature, 0)
+                if sig_magic != 0xFADE0CC0 or not 12 + slots * 8 <= sig_length <= len(signature):
+                    raise ValueError("invalid embedded code signature")
+                signature = signature[:sig_length]
+                for index in range(slots):
+                    slot, blob_offset = unpack(">II", signature, 12 + index * 8)
+                    if slot != 5:  # CSSLOT_ENTITLEMENTS
+                        continue
+                    blob_magic, blob_length = unpack(">II", signature, blob_offset)
+                    if (blob_magic != 0xFADE7171 or blob_length < 8
+                            or blob_offset < 12 + slots * 8
+                            or blob_offset + blob_length > sig_length):
+                        raise ValueError("invalid entitlement blob")
+                    value = _read_plist(signature[blob_offset + 8:blob_offset + blob_length],
+                                        "entitlement blob")
+                    entitlements.update(key for key in value if key not in SIGNING_ENTITLEMENTS)
+            cursor += size
+
+    parse(executable)
     return sorted(entitlements)
 
 
@@ -90,7 +141,18 @@ def extract_app_permissions(ipa_path: Path) -> tuple[str, dict]:
     try:
         with zipfile.ZipFile(ipa_path) as archive:
             executable_path, info = _find_main_app(archive)
-            executable = archive.read(executable_path)
+            entitlements = set(_extract_entitlements(archive.read(executable_path)))
+            app_directory = PurePosixPath(executable_path).parent
+            for name in archive.namelist():
+                path = PurePosixPath(name)
+                if (path.is_relative_to(app_directory) and path.name == "Info.plist"
+                        and path.parent.suffix == ".appex"):
+                    extension = _read_plist(archive.read(name), name)
+                    executable = extension.get("CFBundleExecutable")
+                    if not isinstance(executable, str) or not executable.strip():
+                        raise ValueError(f"invalid IPA: {name} is missing CFBundleExecutable")
+                    entitlements.update(_extract_entitlements(
+                        archive.read(str(path.parent / executable))))
     except (OSError, zipfile.BadZipFile, KeyError) as exc:
         raise ValueError(f"invalid IPA {ipa_path}: {exc}") from exc
 
@@ -102,7 +164,7 @@ def extract_app_permissions(ipa_path: Path) -> tuple[str, dict]:
         and isinstance(value, str)
     }
     return info["CFBundleIdentifier"], {
-        "entitlements": _extract_entitlements(executable),
+        "entitlements": sorted(entitlements),
         "privacy": dict(sorted(privacy.items())),
     }
 
