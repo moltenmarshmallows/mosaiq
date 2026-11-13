@@ -578,6 +578,18 @@ jobs:
           done
           ls -la release/android/
 
+      - name: Sync AltStore permissions from published IPA
+        run: |
+          set -euo pipefail
+          mapfile -t ipa_files < <(find ./artifacts/ios -name "*.ipa" -type f)
+          if [ "${#ipa_files[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one iOS IPA, found ${#ipa_files[@]}."
+            exit 1
+          fi
+          python3 scripts/sync-altstore-permissions.py \
+            "${ipa_files[0]}" \
+            --source docs/altstore-source.meta.json
+
       - name: Reserve release tag (atomic)
         id: reserve
         env:

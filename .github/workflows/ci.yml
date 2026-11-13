@@ -32,6 +32,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  mobile-permissions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Test AltStore IPA permissions sync
+        run: python3 -m unittest scripts.test_sync_altstore_permissions
+
   changes:
     runs-on: ubuntu-latest
     outputs:
