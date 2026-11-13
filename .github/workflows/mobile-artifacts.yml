@@ -189,7 +189,7 @@ jobs:
         run: |
           chmod +x android/gradlew
           cd android
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease --no-daemon --init-script ../android-kotlin.init.gradle
 
       - name: Package Android artifact
         run: |
@@ -287,7 +287,7 @@ jobs:
         run: |
           chmod +x android/gradlew
           cd android
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease --no-daemon --init-script ../android-kotlin.init.gradle
 
       - name: Package Android TV artifact
         run: |

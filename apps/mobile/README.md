@@ -48,6 +48,11 @@ npx expo prebuild --platform android --clean --no-install
 EXPO_TV=1 npx expo prebuild --platform android --clean --no-install
 ```
 
+For either generated Android project, build with
+`cd android && ./gradlew assembleRelease --init-script ../android-kotlin.init.gradle`.
+The init script aligns React Native's Gradle plugin Kotlin compiler with Expo's
+so it can read the Kotlin metadata bundled with Gradle 9.4.
+
 `metro.config.js` remaps TypeScript ESM `.js` import specifiers inside workspace packages (e.g. `@vmp/shared`) to sibling `.ts` sources. Without that, Metro looks for `foo.js.ts` and fails when a runtime import pulls in the shared barrel (see mobile CI / `cmsSystemPages.js`).
 
 `package-lock.json` in this directory is committed so `npm ci` is reproducible. After changing `package.json` versions, run `npm install` here (not the repo root) to refresh this lockfile.
