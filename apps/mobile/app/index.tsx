@@ -138,7 +138,7 @@ export default function HomeScreen() {
         contentContainerStyle={[styles.list, tv && styles.listTv]}
         columnWrapperStyle={tv ? styles.columnWrapper : undefined}
         ListEmptyComponent={
-          !loading ? <Text style={styles.muted}>No published videos yet.</Text> : null
+          !loading ? <Text style={styles.muted}>No published videos yet.</Text> : undefined
         }
         renderItem={({ item, index }) => {
           const thumb = catalogThumbnailUrl(item.thumbnail_url);
