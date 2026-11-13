@@ -86,7 +86,7 @@ export default function DownloadsScreen() {
         keyExtractor={(item) => item.videoId}
         contentContainerStyle={styles.list}
         ListEmptyComponent={
-          !loading ? <Text style={styles.muted}>No offline downloads yet.</Text> : null
+          !loading ? <Text style={styles.muted}>No offline downloads yet.</Text> : undefined
         }
         renderItem={({ item }) => (
           <View style={styles.row}>
