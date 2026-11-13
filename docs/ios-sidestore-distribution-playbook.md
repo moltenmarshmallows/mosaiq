@@ -113,10 +113,16 @@ If you already did that and the site shows the “Wrong GitHub Pages deployer”
 
 ## Updating permissions metadata
 
-When native entitlements or Info.plist privacy keys change (after `expo prebuild`), update `docs/altstore-source.meta.json`:
+The Mobile artifacts publish job synchronizes `appPermissions` from the exact IPA it is about to publish. To inspect or check the metadata locally:
 
-- `appPermissions.entitlements` — iOS entitlements (e.g. associated domains).
-- `appPermissions.privacy` — `NS*UsageDescription` keys from Info.plist.
+```bash
+python3 scripts/sync-altstore-permissions.py path/to/vmp.ipa \
+  --print-app-permissions
+python3 scripts/sync-altstore-permissions.py path/to/vmp.ipa \
+  --source docs/altstore-source.meta.json --check
+```
+
+To patch the metadata from a built IPA, omit `--check`. Use `--no-entitlements` to update only privacy strings while preserving the source entitlements. The script supports both the single `app` template in `docs/altstore-source.meta.json` and generated sources with an `apps` array.
 
 Regenerate the AltStore source locally (writes `docs/altstore-source.json`, which is **not** committed):
 
