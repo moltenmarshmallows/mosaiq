@@ -1,0 +1,13 @@
+// React Native 0.86's Gradle plugin uses Kotlin 2.1, which cannot read
+// Gradle 9.4's Kotlin 2.3 metadata. Match Expo's Gradle plugin compiler.
+gradle.beforeSettings { settings ->
+  settings.pluginManagement {
+    resolutionStrategy {
+      eachPlugin {
+        if (requested.id.id == 'org.jetbrains.kotlin.jvm' && requested.version == '2.1.20') {
+          useVersion('2.2.21')
+        }
+      }
+    }
+  }
+}
