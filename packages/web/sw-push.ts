@@ -272,3 +272,5 @@ sw.addEventListener('notificationclick', (event: NotificationEvent) => {
     })(),
   );
 });
+
+export {};
