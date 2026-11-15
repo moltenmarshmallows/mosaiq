@@ -138,3 +138,5 @@ sw.addEventListener('fetch', (event: FetchEvent) => {
   if (!url.pathname.startsWith(OFFLINE_MEDIA_URL_PREFIX)) return;
   event.respondWith(serveOfflineMedia(event.request));
 });
+
+export {};

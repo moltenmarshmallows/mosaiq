@@ -12,7 +12,8 @@
         "pages/**/*.{vue,ts}",
         "plugins/**/*.{ts,vue}",
         "middleware/**/*.ts",
-        "server/**/*.ts"
+        "server/**/*.ts",
+        "sw.ts"
       ],
       "project": [
         "components/**/*.vue",
@@ -25,7 +26,9 @@
         "pages/**/*.{vue,ts}",
         "nuxt.config.ts",
         "app.vue",
+        "sw.ts",
         "sw-push.ts",
+        "sw-offline-media.ts",
         "tailwind.config.ts"
       ]
     },

@@ -306,16 +306,12 @@ export default defineNuxtConfig({
               },
             ],
           },
-          workbox: {
-            navigateFallback: '/',
-            // The prerendered "/" shell must not be served for deep links — Workbox would
-            // hydrate the homepage on /auth/verify and Nuxt eventually rewrites to /?token=…,
-            // so magic-link login never runs.  Only the bare homepage uses the fallback.
-            navigateFallbackDenylist: [/^\/(?!$)/],
+          // v2 dropped generateSW's `importScripts`; buildSW bundles sw.ts,
+          // which statically imports the push/offline sidecars instead.
+          strategies: 'buildSW',
+          buildSW: {
+            swSrc: 'sw.ts',
             globPatterns: ['**/*.{js,css,html,png,svg,ico,woff2}'],
-            cleanupOutdatedCaches: true,
-            // Keep push handlers in a tiny sidecar file so GenerateSW can still be used.
-            importScripts: ['/sw-push.js', '/sw-offline-media.js'],
           },
           client: {
             installPrompt: true,
