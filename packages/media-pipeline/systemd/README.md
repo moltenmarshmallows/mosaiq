@@ -24,18 +24,18 @@ sudo systemctl daemon-reload
 
 **Adjust paths** if the repo or Node binaries differ:
 
-| Field | Purpose | How to set |
-|-------|---------|------------|
-| `VMP_ROOT` | Repository root (used in `ExecStart`) | Default `/root/vmp` in the unit; override in `/etc/vmp/env` |
-| `NODE_BIN` | Node binary | Default `/usr/bin/node` in the unit; override in `/etc/vmp/env` |
-| `NPM_BIN` | npm binary (deploy-time build only) | Default `/usr/bin/npm` in the unit; override in `/etc/vmp/env` |
+| Field       | Purpose                               | How to set                                                               |
+| ----------- | ------------------------------------- | ------------------------------------------------------------------------ |
+| `VMP_ROOT`  | Repository root (used in `ExecStart`) | Default `/root/vmp` in the unit; override in `/etc/vmp/env`              |
+| `NODE_BIN`  | Node binary                           | Default `/usr/bin/node` in the unit; override in `/etc/vmp/env`          |
+| `NPM_BIN`   | npm binary (deploy-time build only)   | Default `/usr/bin/npm` in the unit; override in `/etc/vmp/env`           |
 | `ExecStart` | Absolute path to `dist/supervisor.js` | `${NODE_BIN}` + `${VMP_ROOT}/packages/media-pipeline/dist/supervisor.js` |
 
 `WorkingDirectory` is **not** set in the shipped unit: `ExecStart` uses an absolute script path, so changing `VMP_ROOT` in `/etc/vmp/env` is enough for a non-default install path.
 
 If you add `WorkingDirectory` (optional, for tools that assume cwd = repo root), it is a **systemd unit directive only** — `/etc/vmp/env` cannot change it. When the repo is not at `/root/vmp`, either:
 
-1. Edit `WorkingDirectory=` in `/etc/systemd/system/vmp-supervisor.service` (same path as `VMP_ROOT`), then `sudo systemctl daemon-reload`, or  
+1. Edit `WorkingDirectory=` in `/etc/systemd/system/vmp-supervisor.service` (same path as `VMP_ROOT`), then `sudo systemctl daemon-reload`, or
 2. Create a drop-in, e.g. `/etc/systemd/system/vmp-supervisor.service.d/override.conf`:
 
 ```ini
@@ -159,8 +159,8 @@ If a job exceeds that threshold, the supervisor **stops** sending `WATCHDOG=1`. 
 
 ## Related documentation
 
-| Document | Description |
-| --- | --- |
-| [Repository README](../../../README.md) | Monorepo overview and documentation map |
+| Document                                          | Description                                                |
+| ------------------------------------------------- | ---------------------------------------------------------- |
+| [Repository README](../../../README.md)           | Monorepo overview and documentation map                    |
 | [packages/media-pipeline/README.md](../README.md) | Pipeline, supervisor, webhooks, TTP logging, env reference |
-| [AGENTS.md](../../../AGENTS.md) | Worker secrets and pipeline callback endpoints |
+| [AGENTS.md](../../../AGENTS.md)                   | Worker secrets and pipeline callback endpoints             |

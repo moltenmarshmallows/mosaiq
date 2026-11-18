@@ -5,8 +5,13 @@
 
 import { mkdir, readdir, rename, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { ENCORE_JOB_PRIORITY } from './encorePriorities.js';
-import { detectGpuEncodeConfig, resolveEncoreProfileBase } from './gpuDetect.js';
+import { encorePriorityFor } from './encorePriorities.js';
+import {
+  type GpuBackend,
+  gpuProfileSuffixFor,
+  resolveEncoreProfileBase,
+  resolveSubmitBackend,
+} from './gpuDetect.js';
 
 /** Optional parallel segment encode (seconds). Requires Encore shared-work-dir. */
 export function encoreSegmentLengthSeconds(): number | undefined {
@@ -24,12 +29,25 @@ export type EncoreJobStatus =
   | 'FAILED'
   | 'CANCELLED';
 
-type EncoreJob = {
+export type EncoreJobOutput = {
+  file?: string;
+  type?: string;
+  format?: string;
+  videoStreams?: Array<{ bitrate?: number; codec?: string; height?: number; width?: number }>;
+  audioStreams?: Array<{ bitrate?: number; channels?: number; codec?: string }>;
+};
+
+export type EncoreJob = {
   id?: string;
   status?: EncoreJobStatus;
   progress?: number;
   message?: string;
   externalId?: string;
+  outputFolder?: string;
+  baseName?: string;
+  profile?: string;
+  output?: EncoreJobOutput[];
+  inputs?: Array<{ type?: string; uri?: string }>;
 };
 
 const ENCORE_BASE_URL = (process.env.ENCORE_BASE_URL || 'http://127.0.0.1:8080')
@@ -231,22 +249,24 @@ const PROFILE_GPU_VARIANTS: Record<string, string[]> = {
   'vmp-podcast-preview': ['vmp-podcast-preview'],
 };
 
-/** Pick best registered Encore profile for this host (GPU when available). */
-export async function resolveEncoreProfileName(profileBase: string): Promise<string> {
-  const gpu = await detectGpuEncodeConfig();
+/**
+ * Pick the best registered Encore profile for the current worker fleet.
+ * Returns the profile name plus the resolved backend so callers can route
+ * the job to the matching capability queue (see encorePriorities.ts).
+ */
+export async function resolveEncoreProfile(
+  profileBase: string,
+): Promise<{ profile: string; backend: GpuBackend; queueClass: 'gpu' | 'cpu' }> {
+  const backend = await resolveSubmitBackend();
+  const suffix = gpuProfileSuffixFor(backend);
   const variants = PROFILE_GPU_VARIANTS[profileBase];
-  if (!variants) {
-    return resolveEncoreProfileBase(profileBase, gpu.profileSuffix);
-  }
-  if (gpu.backend === 'nvenc') {
-    const nvenc = variants.find((c) => c.includes('nvenc'));
-    if (nvenc) return nvenc;
-  }
-  if (gpu.backend === 'vaapi') {
-    const vaapi = variants.find((c) => c.includes('vaapi'));
-    if (vaapi) return vaapi;
-  }
-  return variants[variants.length - 1];
+  const profile = variants
+    ? ((suffix ? variants.find((c) => c.endsWith(suffix)) : undefined) ??
+      variants[variants.length - 1])
+    : resolveEncoreProfileBase(profileBase, suffix);
+  // Queue class follows the profile's requirement, not the fleet: a CPU-only
+  // profile (e.g. vmp-1080p) must stay in queue 1 even when GPU workers exist.
+  return { profile, backend, queueClass: profile.includes('-gpu-') ? 'gpu' : 'cpu' };
 }
 
 export const ENCORE_PROFILES = {
@@ -257,38 +277,35 @@ export const ENCORE_PROFILES = {
 
 export type EncoreRenditionKey = keyof typeof ENCORE_PROFILES;
 
-export async function transcodeRenditionWithEncore(options: {
+/**
+ * Submit one Encore job per rendition (VMP_LADDER_SPLIT=renditions).
+ * Returns the finished jobs so the caller can hand their merged outputs to
+ * the packager via the supervisor's aggregate endpoint.
+ */
+export async function submitRenditionJobs(options: {
   videoId: string;
   inputPath: string;
   outputDir: string;
-  rendition: EncoreRenditionKey;
-  targetFileName: string;
-  onProgress?: (progress: number) => void;
   isCancelled?: () => boolean;
-}): Promise<string> {
-  const profile = await resolveEncoreProfileName(ENCORE_PROFILES[options.rendition]);
-  const baseName = `vmp-${options.videoId}-${options.rendition}`;
-  const attemptId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const encoreOutDir = path.join(options.outputDir, 'encore', options.rendition, attemptId);
-  await mkdir(encoreOutDir, { recursive: true });
-
-  const jobId = await submitEncoreJob({
-    profile,
-    inputPath: options.inputPath,
-    outputFolder: encoreOutDir,
-    baseName,
-    externalId: `${options.videoId}:${options.rendition}`,
-    priority:
-      options.rendition === '720p'
-        ? ENCORE_JOB_PRIORITY.RENDITION_720P
-        : ENCORE_JOB_PRIORITY.RENDITION_OTHER,
-    segmentLength: encoreSegmentLengthSeconds(),
-  });
-
-  await waitForEncoreJob(jobId, {
-    onProgress: (progress) => options.onProgress?.(progress),
-    isCancelled: options.isCancelled,
-  });
-
-  return adoptEncoreOutput(encoreOutDir, options.targetFileName);
+}): Promise<{ rendition: EncoreRenditionKey; jobId: string }[]> {
+  const submitted: { rendition: EncoreRenditionKey; jobId: string }[] = [];
+  for (const rendition of Object.keys(ENCORE_PROFILES) as EncoreRenditionKey[]) {
+    const { profile, queueClass } = await resolveEncoreProfile(ENCORE_PROFILES[rendition]);
+    const encoreOutDir = path.join(options.outputDir, 'encore', 'renditions', rendition);
+    await mkdir(encoreOutDir, { recursive: true });
+    const jobId = await submitEncoreJob({
+      profile,
+      inputPath: options.inputPath,
+      outputFolder: encoreOutDir,
+      baseName: `vmp-${options.videoId}-${rendition}`,
+      externalId: `${options.videoId}:${rendition}`,
+      priority: encorePriorityFor('full_ladder', queueClass),
+      segmentLength: encoreSegmentLengthSeconds(),
+    });
+    submitted.push({ rendition, jobId });
+  }
+  await Promise.all(
+    submitted.map(({ jobId }) => waitForEncoreJob(jobId, { isCancelled: options.isCancelled })),
+  );
+  return submitted;
 }

@@ -20,13 +20,16 @@ export function isLoopbackEncoreUrl(urlString: string): boolean {
   }
 }
 
+const AGGREGATE_PATH_FRAGMENT = '/vmp/api/encoreJobAggregate/';
+
 /**
  * Rewrite Encore job URL so encore-packager can GET it.
  *
  * Priority:
  * 1. PACKAGER_ENCORE_BASE_URL (explicit)
- * 2. If URL is loopback → http://encore-web:8080 (Compose service name)
- * 3. Otherwise leave unchanged (already docker-DNS or public)
+ * 2. Aggregate job docs live on the supervisor → PACKAGER_SUPERVISOR_BASE_URL
+ * 3. If URL is loopback → http://encore-web:8080 (Compose service name)
+ * 4. Otherwise leave unchanged (already docker-DNS or public)
  */
 export function rewriteEncoreJobUrlForPackager(
   encoreJobUrl: string,
@@ -40,6 +43,21 @@ export function rewriteEncoreJobUrlForPackager(
     parsed = new URL(raw);
   } catch {
     return raw;
+  }
+
+  if (parsed.pathname.startsWith(AGGREGATE_PATH_FRAGMENT)) {
+    const supervisorBase = trimTrailingSlash(
+      env.PACKAGER_SUPERVISOR_BASE_URL || 'http://vmp-supervisor:8788',
+    );
+    let base: URL;
+    try {
+      base = new URL(supervisorBase.includes('://') ? supervisorBase : `http://${supervisorBase}`);
+    } catch {
+      throw new Error('Invalid PACKAGER_SUPERVISOR_BASE_URL');
+    }
+    parsed.protocol = base.protocol;
+    parsed.host = base.host;
+    return parsed.toString();
   }
 
   const explicit = (env.PACKAGER_ENCORE_BASE_URL || '').trim();

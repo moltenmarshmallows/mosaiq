@@ -1,9 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import {
-  isLoopbackEncoreUrl,
-  rewriteEncoreJobUrlForPackager,
-} from '../packagerEncoreUrl.js';
+import { isLoopbackEncoreUrl, rewriteEncoreJobUrlForPackager } from '../packagerEncoreUrl.js';
 
 describe('packagerEncoreUrl', () => {
   it('detects loopback Encore URLs', () => {
@@ -14,10 +11,7 @@ describe('packagerEncoreUrl', () => {
   });
 
   it('rewrites loopback to encore-web when PACKAGER_ENCORE_BASE_URL unset', () => {
-    const out = rewriteEncoreJobUrlForPackager(
-      'http://127.0.0.1:8080/encoreJobs/abc',
-      {},
-    );
+    const out = rewriteEncoreJobUrlForPackager('http://127.0.0.1:8080/encoreJobs/abc', {});
     assert.equal(out, 'http://encore-web:8080/encoreJobs/abc');
   });
 
@@ -62,5 +56,21 @@ describe('packagerEncoreUrl', () => {
   it('leaves docker-DNS URLs unchanged without override', () => {
     const url = 'http://encore-web:8080/encoreJobs/abc';
     assert.equal(rewriteEncoreJobUrlForPackager(url, {}), url);
+  });
+
+  it('routes aggregate job URLs to the supervisor base', () => {
+    const out = rewriteEncoreJobUrlForPackager(
+      'http://vmp-supervisor:8788/vmp/api/encoreJobAggregate/agg-v1',
+      { PACKAGER_SUPERVISOR_BASE_URL: 'http://media.lan:8788' },
+    );
+    assert.equal(out, 'http://media.lan:8788/vmp/api/encoreJobAggregate/agg-v1');
+  });
+
+  it('aggregate rewrite wins over PACKAGER_ENCORE_BASE_URL', () => {
+    const out = rewriteEncoreJobUrlForPackager(
+      'http://127.0.0.1:8788/vmp/api/encoreJobAggregate/agg-v1',
+      { PACKAGER_ENCORE_BASE_URL: 'http://encore-web:8080' },
+    );
+    assert.equal(out, 'http://vmp-supervisor:8788/vmp/api/encoreJobAggregate/agg-v1');
   });
 });

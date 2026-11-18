@@ -1,260 +1,77 @@
 # @vmp/media-pipeline
 
-VMP media VM orchestration around **[SVT Encore](https://svt.github.io/encore/)** — production-grade transcoding-as-a-service used at Sveriges Television since 2019.
+VMP media orchestration around **[SVT Encore](https://svt.github.io/encore/)** — watchfolder/TUS intake → distributed encode workers → Shaka HLS packaging → private B2/S3 → HMAC callback to `@vmp/api`.
 
-This package replaces the former `@vmp/podcast-host` custom ffmpeg/VAAPI encoder. Encore handles **video transcoding**; VMP still owns:
+## Deployment: two compose files
 
-1. **Watchfolder intake** (`pipeline_watch.ts`) — inbox → stable file detection → video ID assignment
-2. **encore-packager** — Shaka-based fMP4 HLS ladder + object-storage upload (`master.m3u8`, per-rendition playlists, shared audio)
-4. **Podcast MP3** — full `podcast.mp3` + preview jobs (`render_podcast_preview_mp3.ts`)
-5. **Worker callbacks** — HMAC-signed `POST /api/admin/videos/:id/pipeline-status`
-6. **Preview rebuild webhook** — supervisor accepts API-signed `podcast_preview_rebuild` events
+| File                             | Runs                                                                                                                                                                                                                                                                        |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker-compose.coordinator.yml` | Redis, `encore-web` (API only — `POLL_DISABLED`), `encore-packager`, `tusd`, `vmp-supervisor` (dashboard/webhooks/metrics). Optional `observability` profile adds Prometheus + Grafana + redis-exporter.                                                                    |
+| `docker-compose.worker.yml`      | `worker` image (`worker/Dockerfile`): probes real encodes NVENC → VAAPI → CPU, heartbeats the backend to the supervisor, polls the matching Encore queues. `--profile nvidia` / `--profile vaapi` variants pass the GPU device; `--profile packager` adds a local packager. |
 
-## Architecture
-
-Two ingest watchfolders let you A/B **fast-lane** (720p publishable first, then full ladder) vs **full-ladder-only** (single encode pass). Both paths log structured TTP with `pipelineMode` for comparison.
-
-```text
-┌─────────────────┐     POST /encoreJobs      ┌──────────────┐
-│ pipeline_watch  │ ─────────────────────────►│ encore-web   │
-│ (orchestrator)  │◄──── poll job status ─────│ + workers    │
-└────────┬────────┘                           └──────┬───────┘
-         │ enqueue packaging (Redis)                  │ FFmpeg (+ GPU profiles when available)
-         ▼                                             ▼
-┌─────────────────┐     S3 upload              shared /media volume
-│ encore-packager │ ─────────────────────────► private B2 (or S3)
-│ (scale workers) │
-└────────┬────────┘
-         ▼
-   @vmp/api Worker  ◄── pipeline-status callback (HMAC)
-```
-
-Encore transcodes → supervisor enqueues [Eyevinn encore-packager](https://github.com/Eyevinn/encore-packager) → packager runs Shaka and uploads HLS to private object storage. Scale Encore workers and packager replicas independently via Compose `--scale` (e.g. 3 encode + 3 package).
-
-Encore does **not** package HLS — that matches [SVT’s design](https://svt.github.io/encore/).
-
-## Contents
-
-- [Quick start (VM)](#quick-start-vm)
-- [Encore deployment](#encore-deployment)
-- [Run supervisor (systemd)](#run-supervisor-systemd)
-- [Environment](#environment)
-- [Object storage layout](#object-storage-layout)
-- [Migration from podcast-host](#migration-from-podcast-host)
-- [Related documentation](#related-documentation)
-
-## Quick start (VM)
-
-From a git checkout of this monorepo:
+### Minimal example (one host)
 
 ```bash
-cd /path/to/vmp
-npm install
-npm run build --workspace=@vmp/media-pipeline
-cp packages/media-pipeline/encore/.env.example packages/media-pipeline/encore/.env
-# Fill secrets + PACKAGE_OUTPUT_FOLDER + S3_ENDPOINT_URL + AWS_* (B2 keys)
+cd packages/media-pipeline
+cp .env.example .env   # fill secrets + B2 values
+docker compose -f docker-compose.coordinator.yml --env-file .env up -d
+docker compose -f docker-compose.worker.yml      --env-file .env up -d
 ```
 
-Start Encore (Redis + web; encodes on `encore-web` by default). Compose **fails fast** if required secrets are missing:
+Dashboard: `http://127.0.0.1:8788` (secret = `VMP_SUPERVISOR_DASHBOARD_SECRET`). Drop a `.mp4` into `$ENCORE_MEDIA_MOUNT/videos/inbox-fast-lane/` and watch it flow.
 
-```bash
-npm run encore:up --workspace=@vmp/media-pipeline
-npm run encore:doctor --workspace=@vmp/media-pipeline
-# or: docker compose -f packages/media-pipeline/encore/docker-compose.yml up -d
-```
+### Scale out (LAN/cloud)
 
-**Horizontal scale** (API-only web + durable worker pools + packager replicas via `--scale`):
+1. On the worker host, mount the **same media tree** at `/media` (NFS export of the coordinator's media dir — same paths everywhere is the contract).
+2. Copy `docker-compose.worker.yml` + `.env` over, set `VMP_COORDINATOR=<coordinator host/IP>` and `VMP_REDIS_BIND`/`VMP_UI_BIND` on the coordinator so Redis + supervisor are LAN-reachable.
+3. `docker network create vmp-media` once, then `docker compose -f docker-compose.worker.yml --env-file .env --profile nvidia up -d` (or `vaapi`, or plain CPU `worker`).
 
-```bash
-ENCORE_WORKER_HIGH_REPLICAS=3 ENCORE_WORKER_LOW_REPLICAS=2 ENCORE_PACKAGER_REPLICAS=3 \
-  npm run encore:up:scale --workspace=@vmp/media-pipeline
-```
+Every worker registers in the dashboard's **Encode workers** table and immediately adds concurrency. GPU workers drain GPU-class jobs first, then CPU work; CPU workers can never take a GPU-profile job.
 
-Configure `/etc/vmp/env` (see [Environment](#environment)), then install the systemd unit from [systemd/README.md](systemd/README.md).
+### How capability routing works
 
-Reliability contracts (single-node and scale share these): [docs/plans/media-pipeline-reliability.md](../../docs/plans/media-pipeline-reliability.md).
+Encore's two priority queues become **capability classes** (`encorePriorities.ts`):
 
-## Encore deployment
+- priority ≥ 50 → **queue 0, GPU class** (polled only by GPU workers via `poll-higher-prio`)
+- priority < 50 → **queue 1, CPU class** (all workers)
 
-Bundled Compose stack: [`encore/docker-compose.yml`](encore/docker-compose.yml)
+The pipeline asks the worker registry (`workerRegistry.ts`, Redis-backed heartbeats at `/api/workers/heartbeat`) which backends are **live right now**, then picks `*-gpu-nvenc` / `*-gpu-vaapi` profile variants only when a matching worker exists — otherwise the plain CPU profile. The coordinator's own GPU is irrelevant; profile choice always follows the fleet.
 
-| Service | Image | Role |
-| --- | --- | --- |
-| `redis` | `redis:8.6-alpine` | Job queue (Encore + packager) |
-| `encore-web` | `ghcr.io/svt/encore-web:latest` | REST API + optional job poller / FFmpeg encode (`POST /encoreJobs`, Swagger UI) |
-| `vmp-supervisor` | `ghcr.io/tojemoc/vmp-media-pipeline:latest` | Watchfolder orchestrator, dashboard, webhooks, packaging queue API |
-| `encore-packager` | `eyevinntechnology/encore-packager:latest` | Shaka HLS + S3/B2 upload (`docker compose --scale encore-packager=N`) |
+### `VMP_LADDER_SPLIT`
 
-### Scaling encoding horizontally
+- `job` (default): one Encore job encodes the whole ABR ladder.
+- `renditions`: one Encore job per resolution — 1080p/720p/480p can run on different workers concurrently. The supervisor serves a merged job document at `/vmp/api/encoreJobAggregate/:id` so the stock packager still sees one ladder.
 
-SVT `encore-worker` is a **one-shot** process (one job, or drain queue → exit). Official guidance is KEDA / Kubernetes jobs ([deployment docs](https://svt.github.io/encore/deployment/)).
+### Intake
 
-| Overlay | Purpose |
-| --- | --- |
-| [`encore/docker-compose.scale.yml`](encore/docker-compose.scale.yml) | **Durable** Compose pools: loop wrapper + `encore-worker-high` (queue 0) + `encore-worker-low` (queue 1); disables web poller |
-| [`encore/docker-compose.workers.yml`](encore/docker-compose.workers.yml) | KEDA-style batch workers (`restart: "no"`, no loop) |
-| `docker-compose.scale.vaapi.yml` / `.nvidia.yml` / `.nfs.yml` | GPU / mapall for scaled workers |
+- **Watchfolders** — `INBOX_FAST_LANE_DIR` → fast-lane (720p preview first, then ladder), `INBOX_FULL_LADDER_DIR` → ladder only.
+- **TUS resumable uploads** — `tusd` accepts uploads; the supervisor proxies `/vmp/uploads` (dashboard-secret auth) and `tusd`'s post-finish hook moves completed files into the same inboxes. `meta_data.pipelineMode=full_ladder|fast_lane`, optional `meta_data.videoId`. Clients upload with any tus client to `POST {supervisor}/vmp/uploads` + Bearer dashboard secret.
 
-With `concurrency: 2`, VMP maps Encore job priorities so fast-lane 720p (`priority` 80) hits **queue 0** and full ladder / podcast (`≤49`) hits **queue 1** — see `encorePriorities.ts`.
+### Observability
 
-Optional **intra-job** parallelism: set `ENCORE_SEGMENT_LENGTH_SECONDS` (e.g. `120`) so large encodes split across workers via Encore segmented encode (`shared-work-dir` is already mounted).
-
-```bash
-# Example: 3 high + 2 low encode workers, 3 packagers
-# Plain Compose ignores Swarm deploy.replicas — npm run encore:up:scale passes --scale.
-ENCORE_WORKER_HIGH_REPLICAS=3 ENCORE_WORKER_LOW_REPLICAS=2 ENCORE_PACKAGER_REPLICAS=3 \
-  npm run encore:up:scale --workspace=@vmp/media-pipeline
-```
-
-Default single-VM compose still encodes on `encore-web` (no worker overlay).
-
-VMP-specific encoding profiles live in [`encore/profiles/`](encore/profiles/):
-
-| Profile | Rendition | Notes |
-| --- | --- | --- |
-| `vmp-720p-audio` (+ GPU variants) | 720p + AAC | Fast-lane phase 1 |
-| `vmp-full-ladder` (+ GPU VAAPI) | 1080p + 720p + 480p | Full ladder (single job) |
-| `vmp-podcast-mp3` / `vmp-podcast-preview` | Audio sidecars | Queued path podcast MP3 |
-
-**Shared storage:** mount the same host tree Encore and the orchestrator use. Default Compose bind-mounts `${ENCORE_MEDIA_MOUNT:-/mnt}` → `/media` inside containers. On the host, set:
-
-```bash
-MEDIA_HOST_ROOT=/mnt
-ENCORE_MEDIA_ROOT=/media   # path as seen inside Encore containers
-```
-
-**TrueNAS / NFS `mapall`:** stock images run as uid `1000` (encore-web) and `999` (vmp-supervisor). If the share squashes to another user (e.g. `3000:3000`), those containers get `Permission denied` on `/media`. Run:
-
-```bash
-MEDIA_USER=3000:3000 docker compose -f docker-compose.yml -f docker-compose.nfs.yml up -d
-```
-
-If Encore runs natively (JAR) on the same host without path translation, omit `ENCORE_MEDIA_ROOT` or set it equal to `MEDIA_HOST_ROOT`.
-
-Official Encore docs: [Getting started](https://svt.github.io/encore/getting-started/) · [OpenAPI](https://svt.github.io/encore-doc/openapi.html)
-
-## Run supervisor
-
-**Recommended (Docker):** the supervisor runs in the same Compose stack as Encore — no host Node/npm or systemd required.
-
-```bash
-cd packages/media-pipeline/encore
-cp .env.example .env   # fill secrets
-docker compose up -d
-curl -fsS http://127.0.0.1:8788/health
-```
-
-Image: `ghcr.io/tojemoc/vmp-media-pipeline` (built on every merge to `main` via `.github/workflows/media-pipeline-docker.yml`). Override with `VMP_SUPERVISOR_IMAGE` or `docker compose build vmp-supervisor` for a local build from the repo checkout.
-
-**Alternative (systemd):** install the unit from [systemd/README.md](systemd/README.md). Requires `npm run build --workspace=@vmp/media-pipeline` on the host and a system Node binary (or `NODE_BIN` in `/etc/vmp/env` for NVM).
-
-Expose the supervisor HTTP port to the Worker only (VPN, SSH tunnel, or reverse proxy). Admin webhook URL:
-
-`https://your-media-host/vmp/api/podcast-preview-rebuild`
-
-When the supervisor listens on a public interface (`VMP_UI_HOST=0.0.0.0`), set `VMP_SUPERVISOR_DASHBOARD_SECRET` and enter it in the dashboard unlock form. Webhook paths remain authenticated via HMAC (`VMP_WEBHOOK_SECRET`); packaging callbacks use their own secrets.
+- `GET /metrics` on the supervisor — Prometheus exposition: queue depth, active jobs by stage, workers by backend, Encore/Redis health, last TTP, process stats.
+- `docker compose -f docker-compose.coordinator.yml --profile observability` — Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard.
+- TTP events still land in the TTP JSONL log and DogStatsD (`DD_*`).
 
 ## Environment
 
-### Encore
+See `.env.example` — every required var fails fast at `docker compose up`. Notables:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ENCORE_BASE_URL` | `http://127.0.0.1:8080` | Encore web API base URL |
-| `ENCORE_USER` / `ENCORE_PASSWORD` | — | HTTP basic auth when `ENCORE_SECURITY_ENABLED=true` |
-| `ENCORE_MEDIA_ROOT` | `MEDIA_HOST_ROOT` | Path prefix Encore workers read (container mount) |
-| `MEDIA_HOST_ROOT` | `/mnt` | Host path prefix for inbox/tmp |
-| `ENCORE_POLL_MS` | `2000` | Job status poll interval |
-| `ENCORE_JOB_TIMEOUT_MS` | `7200000` | Per-rendition transcode timeout (2 h) |
-| `ENCORE_WORKER_HIGH_REPLICAS` | `2` | Scale overlay: queue-0 worker replicas |
-| `ENCORE_WORKER_LOW_REPLICAS` | `2` | Scale overlay: queue-1 worker replicas |
-| `ENCORE_PACKAGER_REPLICAS` | `1` (base) / `2` (scale overlay) | encore-packager replicas |
-| `ENCORE_SEGMENT_LENGTH_SECONDS` | (unset) | Optional Encore segmented encode length (parallel across workers) |
-| `VMP_GPU_BACKEND` | `auto` | `auto` \| `vaapi` \| `nvenc` \| `cpu` — picks Encore profile variant |
-| `VAAPI_DEVICE` | `/dev/dri/renderD128` | Passed to VAAPI Compose overlays |
+| Var                            | Purpose                                                        |
+| ------------------------------ | -------------------------------------------------------------- |
+| `VMP_WORKER_TOKEN`             | Shared worker↔coordinator heartbeat auth                       |
+| `VMP_COORDINATOR`              | Worker-side: coordinator host/IP (unset = same docker network) |
+| `VMP_LADDER_SPLIT`             | `job` or `renditions`                                          |
+| `VMP_FORCE_BACKEND`            | Worker entrypoint: skip probing, force `nvenc`/`vaapi`/`cpu`   |
+| `PACKAGER_SUPERVISOR_BASE_URL` | Base URL packagers use for aggregate job docs                  |
 
-### Pipeline mode (dual inbox)
+## Image notes
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `INBOX_FAST_LANE_DIR` | `/mnt/videos/inbox-fast-lane` | **fast_lane** — 720p first, then full ladder (720p encoded twice) |
-| `INBOX_FULL_LADDER_DIR` | `/mnt/videos/inbox-full-ladder` | **full_ladder** — single full ladder, `fully_processed` when done |
-| `INBOX_DIR` | — | Legacy: if set, subdirs `fast-lane` / `full-ladder` are used when the above are unset |
-| `REDIS_URL` | `redis://127.0.0.1:6379` | Packaging queue (supervisor + packager) |
-| `VMP_SUPERVISOR_URL` | `http://127.0.0.1:8788` | Packaging enqueue/status API |
-| `PACKAGER_CALLBACK_URL` | `http://vmp:$VMP_PACKAGER_SECRET@vmp-supervisor:8788/vmp/api` | encore-packager callbacks (Basic auth; Eyevinn does not send custom headers) |
-| `PACKAGE_FORMAT_OPTIONS_JSON` | `{"segmentDuration":2}` | Shaka options via encore-packager — **keep `segmentDuration` aligned with encode GOP** (profiles use `g`/`keyint_min` **60** @ 30fps = **2s** IDR; was 180/6s) |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `S3_ENDPOINT_URL` | — | Private B2 (S3) credentials for encore-packager (`PACKAGE_OUTPUT_FOLDER=s3://…`) |
-| `S3_BUCKET_NAME` / `B2_*` | — | Supervisor `@vmp/storage` bucket + creds (`STORAGE_PROVIDER=b2`; aliases accepted) |
-| `STORAGE_PROVIDER` | `b2` (Compose) | Supervisor object-storage provider |
-| `PACKAGER_ENCORE_BASE_URL` | `http://encore-web:8080` (Compose) | Rewrite Encore job URLs for packager when host uses loopback |
-| `VMP_PACKAGER_SECRET` | required | Base64url secret; must match Basic auth password in packager `CALLBACK_URL` |
+- `vmp-supervisor` — built by `.github/workflows/media-pipeline-docker.yml` from `Dockerfile`.
+- `vmp-encore-worker` — built by the same workflow from `worker/Dockerfile` (stock `encore-worker` binary + Ubuntu ffmpeg with NVENC/VAAPI/QSV + VA drivers). The stock SVT image has **no GPU-capable ffmpeg** — GPU profiles require this image.
 
-### HLS segment duration (startup latency)
+## Related docs
 
-New encodes target **2s** CMAF segments (was 6s after PR #162). Two knobs must stay in sync:
-
-1. Encore profiles under `encore/profiles/` — `g` / `keyint_min: 60` at `r: 30`
-2. `PACKAGE_FORMAT_OPTIONS_JSON` on `encore-packager` — `segmentDuration: 2`
-
-Already-published VOD stays at whatever segment length it was packaged with until re-encoded. Shorter segments cut first-byte media size (~⅓ of a 6s segment) at the cost of more requests per minute of playback.
-
-Drop a file in **fast-lane** inbox to stagger publish; drop in **full-ladder** for one-shot encoding. TTP logs include `pipelineMode` on every milestone for A/B analysis.
-
-### VMP orchestrator
-
-| Variable | Purpose |
-| --- | --- |
-| `VMP_WEBHOOK_SECRET` | Same as `podcast_rebuild_webhook_secret` in D1 |
-| `VMP_SUPERVISOR_DASHBOARD_SECRET` | Protects dashboard + `/api/status` + job control (required when `VMP_UI_HOST` is not loopback) |
-| `VMP_API_BASE_URL` | Worker base URL for pipeline status callbacks |
-| `VMP_API_PIPELINE_SECRET` | Shared HMAC with Worker `VMP_API_PIPELINE_SECRET` |
-| `VMP_UI_HOST` / `VMP_UI_PORT` | Supervisor dashboard + webhook bind (default `127.0.0.1:8788`) |
-| `VMP_RUN_PIPELINE` | `1` run watchfolder; `0` UI + preview jobs only |
-| `INBOX_FAST_LANE_DIR` / `INBOX_FULL_LADDER_DIR` | Dual watchfolders (see above) |
-| `TMP_DIR_BASE` | Temp encode dirs (default `/mnt/tmp/video_pipeline`) |
-| `VMP_TTP_LOG_PATH` | Optional JSONL time-to-publish log |
-| `DD_*` | Datadog DogStatsD tags (see [datadog/README.md](datadog/README.md)) |
-
-**GPU:** `VMP_GPU_BACKEND=auto` probes NVENC then VAAPI at job start and selects `*-gpu-nvenc` / `*-gpu-vaapi` Encore profiles when registered. Mount GPU devices on `encore-web` via `docker-compose.vaapi.yml` / `docker-compose.nvidia.yml`.
-
-### Time-to-publish (TTP) logging
-
-Unchanged — structured `VMP_TTP` lines on stdout. Summarize with:
-
-```bash
-node packages/media-pipeline/scripts/ttp-report.mjs /var/log/vmp-ttp.jsonl
-```
-
-## Object storage layout
-
-Under `videos/{videoId}/`:
-
-- `master.m3u8`, `720p/`, `1080p/`, `480p/`
-- Shared audio: `init_audio.mp4`, `audio.m3u8`, `seg_audio_*.m4s`
-- `podcast.mp3`, `podcast_preview.mp3`
-
-The API video-proxy, RSS enclosures, and admin UI assume this layout — no Worker changes required for the Encore swap.
-
-## Migration from podcast-host
-
-See [MIGRATION.md](MIGRATION.md) for a step-by-step VM cutover checklist.
-
-Summary:
-
-1. Deploy Encore (`npm run encore:up`) and verify `curl http://127.0.0.1:8080/actuator/health`
-2. Stop `vmp-supervisor`, pull this branch, `npm run build --workspace=@vmp/media-pipeline`
-3. Update systemd `ExecStart` paths: `packages/media-pipeline/dist/supervisor.js`
-4. Add Encore env vars; remove `VAAPI_DEVICE`
-5. Start supervisor — pipeline health-checks Encore on boot
-
-## Related documentation
-
-| Document | Description |
-| --- | --- |
-| [MIGRATION.md](MIGRATION.md) | Cutover from `@vmp/podcast-host` |
-| [systemd/README.md](systemd/README.md) | `vmp-supervisor` install |
-| [datadog/README.md](datadog/README.md) | Agent templates |
-| [AGENTS.md](../../AGENTS.md) | Monorepo secrets (`VMP_API_PIPELINE_SECRET`) |
-| [media-pipeline-reliability.md](../../docs/plans/media-pipeline-reliability.md) | Fail-fast env, Redis registry, scale contracts |
-| [SVT Encore docs](https://svt.github.io/encore/) | Upstream transcoder |
+- `ROADMAP.md` / `docs/plans/` — implementation checklist
+- Encore docs: <https://svt.github.io/encore/>
+- encore-packager: <https://github.com/Eyevinn/encore-packager>

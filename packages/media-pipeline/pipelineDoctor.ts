@@ -135,9 +135,7 @@ async function checkStorageConfigured(env: NodeJS.ProcessEnv): Promise<DoctorFin
         ),
       );
     } else {
-      out.push(
-        finding('storage.endpoint', 'ok', `S3 endpoint ${redactUrlCredentials(endpoint)}`),
-      );
+      out.push(finding('storage.endpoint', 'ok', `S3 endpoint ${redactUrlCredentials(endpoint)}`));
     }
   } else if (!hasAws && !hasB2) {
     out.push(
@@ -210,9 +208,7 @@ export async function runPipelineDoctor(
   }
 
   const encoreBase = (env.ENCORE_BASE_URL || 'http://127.0.0.1:8080').trim();
-  findings.push(
-    finding('encore.url', 'ok', `ENCORE_BASE_URL=${redactUrlCredentials(encoreBase)}`),
-  );
+  findings.push(finding('encore.url', 'ok', `ENCORE_BASE_URL=${redactUrlCredentials(encoreBase)}`));
   const packagerEncoreBase = env.PACKAGER_ENCORE_BASE_URL?.trim() || '';
   if (packagerEncoreBase) {
     const normalizedPackagerEncoreBase = packagerEncoreBase.includes('://')
@@ -253,7 +249,11 @@ export async function runPipelineDoctor(
 
   if (env.VMP_PIPELINE_DOCTOR_SKIP_LIVE === '1') {
     findings.push(
-      finding('encore.health', 'warn', 'Skipped live Encore check (VMP_PIPELINE_DOCTOR_SKIP_LIVE=1)'),
+      finding(
+        'encore.health',
+        'warn',
+        'Skipped live Encore check (VMP_PIPELINE_DOCTOR_SKIP_LIVE=1)',
+      ),
     );
     findings.push(
       finding('redis', 'warn', 'Skipped live Redis check (VMP_PIPELINE_DOCTOR_SKIP_LIVE=1)'),

@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # Supervisor: pipeline jobs, queue depth, worker registry, TTP, process stats.
+  - job_name: vmp-supervisor
+    static_configs:
+      - targets: ["vmp-supervisor:8788"]
+
+  # Redis: queue lengths, memory, client counts.
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]

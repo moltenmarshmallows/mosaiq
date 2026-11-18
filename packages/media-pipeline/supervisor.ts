@@ -24,11 +24,15 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildAggregateEncoreJobDoc } from './encoreAggregate.js';
+import { getEncoreJob } from './encoreClient.js';
+import { resolveInboxDir } from './inboxDirs.js';
 import { gauge, increment } from './metrics.js';
 import { rewriteEncoreJobUrlForPackager } from './packagerEncoreUrl.js';
 import { enqueuePackagerJob } from './packagingQueue.js';
 import {
   getPackagingJob,
+  listPackagingJobs,
   markPackagingFailed,
   markPackagingSuccess,
   registerPackagingJob,
@@ -42,6 +46,13 @@ import {
   verifyDashboardSecret,
   verifyPackagerCallbackSecret,
 } from './supervisorAuth.js';
+import { planTusIntake } from './tusIntake.js';
+import {
+  listWorkers,
+  recordWorkerHeartbeat,
+  redisHealthy,
+  type WorkerGpuBackend,
+} from './workerRegistry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = __dirname;
@@ -63,6 +74,18 @@ if (!packagerSecret) {
   console.error('[media-pipeline] Set VMP_PACKAGER_SECRET for packager callback security');
   process.exit(1);
 }
+
+/** Worker heartbeat auth — dedicated token, falls back to the packaging secret. */
+const workerToken = (
+  process.env.VMP_WORKER_TOKEN ||
+  process.env.VMP_PACKAGING_SECRET ||
+  packagingSecret
+).trim();
+const ENCORE_BASE = (process.env.ENCORE_BASE_URL || 'http://127.0.0.1:8080')
+  .trim()
+  .replace(/\/+$/, '');
+const TUSD_URL = (process.env.TUSD_URL || 'http://tusd:1080').trim().replace(/\/+$/, '');
+const WORKER_BACKENDS = new Set<WorkerGpuBackend>(['nvenc', 'vaapi', 'cpu']);
 
 const uiHost = process.env.VMP_UI_HOST || '127.0.0.1';
 const uiPort = Number.parseInt(process.env.VMP_UI_PORT || '8788', 10);
@@ -948,6 +971,10 @@ function dashboardHtml() {
     <div id="pipeline-success">Loading…</div>
   </section>
   <section>
+    <h2>Encode workers</h2>
+    <div id="workers">Loading…</div>
+  </section>
+  <section>
     <h2>TTP summaries (time to publish)</h2>
     <div id="ttp">Loading…</div>
   </section>
@@ -1124,6 +1151,14 @@ function dashboardHtml() {
           '<tr><td>' + escapeHtml(s.videoId || '') + '</td><td>' + escapeHtml(s.minimalMs != null ? (s.minimalMs / 1000).toFixed(1) + 's' : '—') + '</td><td>' + escapeHtml(s.fullMs != null ? (s.fullMs / 1000).toFixed(1) + 's' : '—') + '</td><td>' + escapeHtml(s.minimalRatio != null ? Number(s.minimalRatio).toFixed(2) + '×' : '—') + '</td><td>' + escapeHtml(s.fullRatio != null ? Number(s.fullRatio).toFixed(2) + '×' : '—') + '</td><td>' + escapeHtml(s.at || '') + '</td></tr>'
         ).join('')
         document.getElementById('ttp').innerHTML = '<table><thead><tr><th>Video</th><th>Minimal (720p)</th><th>Full renditions</th><th>Ratio minimal</th><th>Ratio full</th><th>At</th></tr></thead><tbody>' + ttpRows + '</tbody></table>'
+        const workerRows = (d.workers || []).map(w =>
+          '<tr><td>' + escapeHtml(w.hostname || w.workerId || '') + '</td><td>' + escapeHtml(w.gpuBackend || '') +
+          '</td><td>' + escapeHtml(String(w.pollQueue ?? '')) + '</td><td>' + escapeHtml(w.version || '—') +
+          '</td><td>' + escapeHtml(w.lastSeen || '') + '</td></tr>'
+        ).join('')
+        document.getElementById('workers').innerHTML = workerRows
+          ? '<table><thead><tr><th>Worker</th><th>Backend</th><th>Poll queue</th><th>Version</th><th>Last heartbeat</th></tr></thead><tbody>' + workerRows + '</tbody></table>'
+          : '<p>No live workers — jobs will queue until a worker compose registers.</p>'
         document.getElementById('log').textContent = (d.logLines || []).join('\\n')
       } catch (e) {
         document.getElementById('pipeline').textContent = 'Error: ' + e
@@ -1200,6 +1235,7 @@ const server = http.createServer(async (req, res) => {
       pipelineActiveJobs: activeRows,
       pipelineSuccessfulJobs: successRows,
       failedPipelineJobs: failedRows,
+      workers: await listWorkers(),
       ttpSummaries,
       logLines,
     });
@@ -1436,9 +1472,19 @@ const server = http.createServer(async (req, res) => {
       videoId?: string;
       stage?: string;
       pipelineMode?: string;
+      aggregate?: { inputUri?: string; memberJobIds?: string[] };
     };
     if (!reg.jobId || !reg.encoreJobUrl || !reg.videoId || !reg.stage || !reg.pipelineMode) {
       json(res, { error: 'Missing required fields' }, 400);
+      return;
+    }
+    if (
+      reg.aggregate &&
+      (!reg.aggregate.inputUri ||
+        !Array.isArray(reg.aggregate.memberJobIds) ||
+        reg.aggregate.memberJobIds.length === 0)
+    ) {
+      json(res, { error: 'aggregate requires inputUri and memberJobIds' }, 400);
       return;
     }
     const validStages: string[] = ['fast_lane_preview', 'full_ladder'];
@@ -1463,12 +1509,28 @@ const server = http.createServer(async (req, res) => {
     if (packagerJobUrl !== reg.encoreJobUrl) {
       pushLog(`packaging rewrite encoreJobUrl ${reg.encoreJobUrl} → ${packagerJobUrl}`);
     }
+    // Aggregate URLs are fetched by the packager; embed Basic-auth credentials
+    // (verified like packager callbacks) since the packager sends no headers.
+    if (reg.aggregate) {
+      const parsed = new URL(packagerJobUrl);
+      parsed.username = 'vmp';
+      parsed.password = packagerSecret || '';
+      packagerJobUrl = parsed.toString();
+    }
     await registerPackagingJob({
       jobId: String(reg.jobId),
       encoreJobUrl: packagerJobUrl,
       videoId: String(reg.videoId),
       stage: reg.stage as 'fast_lane_preview' | 'full_ladder',
       pipelineMode: reg.pipelineMode as 'fast_lane' | 'full_ladder',
+      aggregate: reg.aggregate
+        ? {
+            inputUri: String(reg.aggregate.inputUri || ''),
+            memberJobIds: Array.isArray(reg.aggregate.memberJobIds)
+              ? reg.aggregate.memberJobIds.map(String)
+              : [],
+          }
+        : undefined,
     });
     try {
       await enqueuePackagerJob(String(reg.jobId), packagerJobUrl);
@@ -1534,7 +1596,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (outcome === 'success') {
-      await markPackagingSuccess(jobId, payload.outputPath ? String(payload.outputPath) : undefined);
+      await markPackagingSuccess(
+        jobId,
+        payload.outputPath ? String(payload.outputPath) : undefined,
+      );
       pushLog(`packager success jobId=${jobId}`);
     } else {
       const errMsg = String(payload.error || payload.message || 'packager failure');
@@ -1545,9 +1610,257 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Encode worker fleet ────────────────────────────────────────────────
+  if (req.method === 'POST' && url.pathname === '/api/workers/heartbeat') {
+    if (!workerToken || !verifyWorkerToken(req)) {
+      json(res, { error: 'Unauthorized' }, 401);
+      return;
+    }
+    const body = (await readJsonBody(req)) as {
+      workerId?: string;
+      hostname?: string;
+      gpuBackend?: string;
+      pollQueue?: number;
+      version?: string;
+    } | null;
+    const workerId = String(body?.workerId || '').trim();
+    const gpuBackend = String(body?.gpuBackend || '').trim() as WorkerGpuBackend;
+    const pollQueue = Number(body?.pollQueue);
+    if (
+      !/^[a-zA-Z0-9._:-]{1,128}$/.test(workerId) ||
+      !WORKER_BACKENDS.has(gpuBackend) ||
+      !Number.isInteger(pollQueue) ||
+      pollQueue < 0 ||
+      pollQueue > 16
+    ) {
+      json(res, { error: 'Invalid worker heartbeat' }, 400);
+      return;
+    }
+    const record = await recordWorkerHeartbeat({
+      workerId,
+      hostname: String(body?.hostname || workerId).slice(0, 128),
+      gpuBackend,
+      pollQueue,
+      version: body?.version ? String(body.version).slice(0, 64) : undefined,
+    });
+    json(res, { ok: true, worker: record });
+    return;
+  }
+
+  // ── Packager-facing aggregate job doc (rendition-split ladders) ────────
+  const aggregateMatch = url.pathname.match(/^\/vmp\/api\/encoreJobAggregate\/([^/]+)$/);
+  if (req.method === 'GET' && aggregateMatch) {
+    if (!verifyPackagerCallbackSecret(req, packagerSecret || '')) {
+      json(res, { error: 'Unauthorized' }, 401);
+      return;
+    }
+    const record = await getPackagingJob(decodeURIComponent(aggregateMatch[1]));
+    if (!record?.aggregate) {
+      json(res, { error: 'Not found' }, 404);
+      return;
+    }
+    try {
+      const members = await Promise.all(record.aggregate.memberJobIds.map(getEncoreJob));
+      const doc = buildAggregateEncoreJobDoc(
+        {
+          jobId: record.jobId,
+          videoId: record.videoId,
+          inputUri: record.aggregate.inputUri,
+          memberJobIds: record.aggregate.memberJobIds,
+        },
+        members,
+      );
+      json(res, doc);
+    } catch (err) {
+      json(res, { error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+    return;
+  }
+
+  // ── tusd post-finish hook → move completed upload into the inbox ───────
+  if (req.method === 'POST' && url.pathname === '/vmp/api/tus-hook') {
+    if (!verifyPackagerCallbackSecret(req, packagerSecret || '')) {
+      json(res, { error: 'Unauthorized' }, 401);
+      return;
+    }
+    const body = await readJsonBody(req);
+    try {
+      const plan = planTusIntake(body as Parameters<typeof planTusIntake>[0]);
+      if (!plan) {
+        json(res, { ok: true, ignored: true });
+        return;
+      }
+      await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
+      await fs.promises.rename(plan.srcPath, plan.destPath);
+      increment('vmp.tus.upload.accepted', 1, { mode: plan.pipelineMode });
+      pushLog(`tus upload → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
+      json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
+    } catch (err) {
+      json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    return;
+  }
+
+  // ── Authenticated TUS upload endpoint (proxied to tusd) ────────────────
+  if (url.pathname === '/vmp/uploads' || url.pathname.startsWith('/vmp/uploads/')) {
+    await proxyTusRequest(req, res, url.pathname);
+    return;
+  }
+
+  // ── Prometheus metrics ─────────────────────────────────────────────────
+  if (req.method === 'GET' && url.pathname === '/metrics') {
+    const text = await buildMetricsText();
+    res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+    res.end(text);
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
+
+function verifyWorkerToken(req: http.IncomingMessage): boolean {
+  const header = req.headers['x-vmp-worker-token'];
+  const provided = Array.isArray(header) ? header[0] : header;
+  if (typeof provided === 'string' && provided.length > 0) {
+    return timingSafeEqualString(provided, workerToken);
+  }
+  return verifyPackagerCallbackSecret(req, workerToken);
+}
+
+/** Proxy /vmp/uploads[/<id>] → tusd /files[/<id>]; dashboard auth already applied. */
+async function proxyTusRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+): Promise<void> {
+  const corsHeaders: Record<string, string> = {
+    'Access-Control-Allow-Origin': req.headers.origin || '*',
+    'Access-Control-Allow-Methods': 'POST, HEAD, PATCH, OPTIONS, DELETE',
+    'Access-Control-Allow-Headers':
+      'Authorization, Content-Type, Upload-Length, Upload-Offset, Upload-Metadata, Tus-Resumable',
+    'Access-Control-Expose-Headers': 'Location, Upload-Offset, Upload-Length, Tus-Resumable',
+    'Tus-Resumable': '1.0.0',
+  };
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { ...corsHeaders, 'Tus-Version': '1.0.0', 'Tus-Extension': 'creation' });
+    res.end();
+    return;
+  }
+  const suffix = pathname === '/vmp/uploads' ? '' : pathname.slice('/vmp/uploads'.length);
+  const upstream = new URL(`${TUSD_URL}/files${suffix}`);
+  const headers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    const key = k.toLowerCase();
+    if (
+      ['host', 'authorization', 'x-vmp-supervisor-token', 'connection', 'content-length'].includes(
+        key,
+      )
+    ) {
+      continue;
+    }
+    if (typeof v === 'string') headers[k] = v;
+  }
+  const proxyReq = http.request(
+    upstream,
+    { method: req.method, headers, timeout: 0 },
+    (proxyRes) => {
+      const outHeaders: Record<string, string | string[]> = { ...corsHeaders };
+      for (const [k, v] of Object.entries(proxyRes.headers)) {
+        if (v == null) continue;
+        const key = k.toLowerCase();
+        if (key === 'location') {
+          // tusd returns http://tusd:1080/files/<id> — rewrite to our public path.
+          outHeaders[k] = String(v).replace(
+            /^https?:\/\/[^/]+\/files/,
+            `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/vmp/uploads`,
+          );
+          continue;
+        }
+        if (key === 'connection' || key === 'transfer-encoding') continue;
+        outHeaders[k] = v as string | string[];
+      }
+      res.writeHead(proxyRes.statusCode || 502, outHeaders);
+      proxyRes.pipe(res);
+    },
+  );
+  proxyReq.on('timeout', () => proxyReq.destroy(new Error('tusd upstream timeout')));
+  proxyReq.on('error', (err) => {
+    if (!res.headersSent) json(res, { error: `tusd unreachable: ${err.message}` }, 502);
+    else res.destroy();
+  });
+  req.pipe(proxyReq);
+}
+
+async function buildMetricsText(): Promise<string> {
+  const lines: string[] = [];
+  const g = (name: string, value: number, labels = '') => {
+    lines.push(`vmp_${name}${labels ? `{${labels}}` : ''} ${Number.isFinite(value) ? value : 0}`);
+  };
+  const esc = (s: string) => s.replace(/["\\]/g, '\\$&');
+
+  g('pipeline_child_alive', pipelineChild && !pipelineState.exited ? 1 : 0);
+  g('pipeline_queue_depth', jobQueue.filter((j) => j.status === 'queued').length);
+  g('supervisor_gpu_slots_used', gpuSlots.current);
+  g('supervisor_gpu_slots_max', gpuSlots.max);
+  g('supervisor_upload_slots_used', uploadSlots.current);
+  g('supervisor_upload_slots_max', uploadSlots.max);
+
+  const stageCounts = new Map<string, number>();
+  for (const job of pipelineActiveJobs.values()) {
+    const stage = String(job.stage || 'unknown');
+    stageCounts.set(stage, (stageCounts.get(stage) || 0) + 1);
+  }
+  for (const [stage, count] of stageCounts)
+    g('pipeline_active_jobs', count, `stage="${esc(stage)}"`);
+  g('pipeline_jobs_failed_total', failedPipelineJobs.length);
+  g('pipeline_jobs_success_total', pipelineSuccessfulJobs.length);
+
+  const workers = await listWorkers();
+  const byBackend = new Map<string, number>();
+  for (const w of workers) byBackend.set(w.gpuBackend, (byBackend.get(w.gpuBackend) || 0) + 1);
+  for (const [backend, count] of byBackend) g('workers', count, `backend="${esc(backend)}"`);
+  g('workers_total', workers.length);
+
+  for (const job of listPackagingJobs()) {
+    g('packaging_jobs', 1, `status="${esc(job.status)}"`);
+  }
+
+  g('redis_up', (await redisHealthy()) ? 1 : 0);
+
+  let encoreUp = 0;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const r = await fetch(`${ENCORE_BASE}/queueCount`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (r.ok) {
+      encoreUp = 1;
+      const data = (await r.json()) as unknown;
+      const counts = Array.isArray(data)
+        ? data
+        : data && typeof data === 'object'
+          ? Object.values(data as Record<string, unknown>)
+          : [];
+      counts.forEach((v, i) => {
+        if (typeof v === 'number') g('encore_queue_depth', v, `queue="${i}"`);
+      });
+    }
+  } catch {
+    /* encore down */
+  }
+  g('encore_up', encoreUp);
+
+  const lastTtp = ttpSummaries[0];
+  if (lastTtp) {
+    if (lastTtp.minimalMs != null) g('ttp_last_minimal_ms', lastTtp.minimalMs);
+    if (lastTtp.fullMs != null) g('ttp_last_full_ms', lastTtp.fullMs);
+    g('ttp_last_total_ms', lastTtp.totalMs);
+  }
+  g('process_uptime_seconds', Math.floor(process.uptime()));
+  g('process_rss_bytes', process.memoryUsage().rss);
+  return `${lines.join('\n')}\n`;
+}
 
 async function bootSupervisor(): Promise<void> {
   if (process.env.VMP_SKIP_PIPELINE_DOCTOR !== '1') {
@@ -1555,7 +1868,9 @@ async function bootSupervisor(): Promise<void> {
     const report = await runPipelineDoctor(process.env);
     process.stdout.write(`${formatDoctorReport(report)}\n`);
     if (!report.ok) {
-      console.error('[media-pipeline] Pipeline doctor failed — fix env/deps or set VMP_SKIP_PIPELINE_DOCTOR=1');
+      console.error(
+        '[media-pipeline] Pipeline doctor failed — fix env/deps or set VMP_SKIP_PIPELINE_DOCTOR=1',
+      );
       process.exit(1);
     }
   } else {

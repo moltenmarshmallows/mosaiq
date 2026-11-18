@@ -7,6 +7,7 @@ import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'n
 import net from 'node:net';
 import path from 'node:path';
 import { checkEncoreHealth } from './encoreClient.js';
+import { resolveInboxDir } from './inboxDirs.js';
 import { gauge, histogram, increment } from './metrics.js';
 import {
   ingestLabelForMode,
@@ -59,13 +60,8 @@ type JobHandle = {
 };
 type ProgressPhase = JobPhase;
 
-const LEGACY_INBOX_DIR = (process.env.INBOX_DIR || '').trim();
-const INBOX_FAST_LANE_DIR =
-  (process.env.INBOX_FAST_LANE_DIR || '').trim() ||
-  (LEGACY_INBOX_DIR ? path.join(LEGACY_INBOX_DIR, 'fast-lane') : '/mnt/videos/inbox-fast-lane');
-const INBOX_FULL_LADDER_DIR =
-  (process.env.INBOX_FULL_LADDER_DIR || '').trim() ||
-  (LEGACY_INBOX_DIR ? path.join(LEGACY_INBOX_DIR, 'full-ladder') : '/mnt/videos/inbox-full-ladder');
+const INBOX_FAST_LANE_DIR = resolveInboxDir('fast_lane');
+const INBOX_FULL_LADDER_DIR = resolveInboxDir('full_ladder');
 const TMP_DIR_BASE = (process.env.TMP_DIR_BASE || '/mnt/tmp/video_pipeline').trim();
 
 type InboxWatchConfig = {
@@ -1042,10 +1038,15 @@ async function startupScan(): Promise<void> {
 
 function startWatcherForInbox(watch: InboxWatchConfig) {
   const child = trackChild(
-    spawn('inotifywait', ['-m', '-e', 'close_write', '--format', '%f', watch.dir], {
-      env: process.env,
-      stdio: ['ignore', 'pipe', 'inherit'],
-    }),
+    spawn(
+      'inotifywait',
+      // moved_to: TUS post-finish hook + NAS syncs often rename files into the inbox.
+      ['-m', '-e', 'close_write', '-e', 'moved_to', '--format', '%f', watch.dir],
+      {
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'inherit'],
+      },
+    ),
   );
   let stdoutBuffer = '';
   const processLines = (lines: string[]): void => {

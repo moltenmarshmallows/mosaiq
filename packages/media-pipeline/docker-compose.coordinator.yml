@@ -1,0 +1,208 @@
+# VMP media pipeline — COORDINATOR.
+#
+# Runs: Redis (job queues + worker registry), Encore API (no encoding),
+# encore-packager (Shaka HLS → B2/S3), tusd (resumable uploads), and the
+# supervisor (dashboard, webhooks, /metrics, packaging registry, TUS hook).
+#
+# Minimal local example (same host):
+#   cp .env.example .env   # fill secrets + B2
+#   docker compose -f docker-compose.coordinator.yml --env-file .env up -d
+#   docker compose -f docker-compose.worker.yml      --env-file .env up -d
+#
+# Scale: run docker-compose.worker.yml on more hosts (LAN/cloud) pointed at
+# this coordinator — every container that touches jobs shares ONE media plane:
+# the same directory tree mounted at /media on coordinator AND every worker
+# (bind mount on one host, NFS export across LAN; see README "Media plane").
+#
+# Optional: add `--profile observability` for Prometheus + Grafana + redis-exporter.
+# Optional: `docker compose ... up -d --scale encore-packager=3` for package concurrency.
+
+name: vmp-media-coordinator
+
+networks:
+  vmp-media:
+    name: vmp-media
+    # Workers on the same host join this network; remote workers reach the
+    # coordinator by IP instead (see docker-compose.worker.yml).
+    external: false
+
+services:
+  redis:
+    image: redis:8.10-alpine
+    restart: unless-stopped
+    networks: [vmp-media]
+    ports:
+      # Remote workers need Redis reachable — bind LAN only, not the internet.
+      - "${VMP_REDIS_BIND:-127.0.0.1}:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  encore-web:
+    # Encore API + queue admin only. Encoding happens on worker nodes
+    # (ENCORE_SETTINGS_POLL_DISABLED=true) so profiles can target real workers.
+    image: ghcr.io/svt/encore-web:latest
+    restart: unless-stopped
+    networks: [vmp-media]
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${ENCORE_HTTP_BIND:-127.0.0.1}:8080:8080"
+    environment:
+      ENCORE_SETTINGS_REDIS_URI: redis://redis:6379
+      ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
+      ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work
+      ENCORE_SETTINGS_CONCURRENCY: "2"
+      ENCORE_SETTINGS_POLL_DISABLED: "true"
+      ENCORE_SETTINGS_SECURITY_ENABLED: "false"
+      ENCORE_SETTINGS_SECURITY_USER_PASSWORD: "${ENCORE_USER_PASSWORD:-change-me-in-production}"
+      ENCORE_SETTINGS_SECURITY_ADMIN_PASSWORD: "${ENCORE_ADMIN_PASSWORD:-change-me-in-production}"
+    volumes:
+      - ./encore/profiles:/profiles:ro
+      - ${ENCORE_MEDIA_MOUNT:-/mnt}:/media
+      - encore-shared-work:/shared/work
+
+  vmp-supervisor:
+    image: ${VMP_SUPERVISOR_IMAGE:-ghcr.io/tojemoc/vmp-media-pipeline:latest}
+    build:
+      context: ../..
+      dockerfile: packages/media-pipeline/Dockerfile
+    restart: unless-stopped
+    networks: [vmp-media]
+    depends_on:
+      redis:
+        condition: service_healthy
+      encore-web:
+        condition: service_started
+    ports:
+      - "${VMP_UI_BIND:-127.0.0.1}:8788:8788"
+    environment:
+      VMP_UI_HOST: "0.0.0.0"
+      VMP_UI_PORT: "8788"
+      VMP_ASSUME_DOCKER: "1"
+      ENCORE_BASE_URL: http://encore-web:8080
+      PACKAGER_ENCORE_BASE_URL: ${PACKAGER_ENCORE_BASE_URL:-http://encore-web:8080}
+      # Aggregate (rendition-split) job docs are served BY the supervisor.
+      PACKAGER_SUPERVISOR_BASE_URL: http://vmp-supervisor:8788
+      REDIS_URL: redis://redis:6379
+      MEDIA_HOST_ROOT: /media
+      ENCORE_MEDIA_ROOT: /media
+      INBOX_FAST_LANE_DIR: ${INBOX_FAST_LANE_DIR:-/media/videos/inbox-fast-lane}
+      INBOX_FULL_LADDER_DIR: ${INBOX_FULL_LADDER_DIR:-/media/videos/inbox-full-ladder}
+      TMP_DIR_BASE: ${TMP_DIR_BASE:-/media/tmp/video_pipeline}
+      TUSD_URL: http://tusd:1080
+      TUSD_DATA_DIR: /media/tus-uploads
+      VMP_LADDER_SPLIT: ${VMP_LADDER_SPLIT:-job}
+      VMP_WORKER_TOKEN: ${VMP_WORKER_TOKEN:?Set VMP_WORKER_TOKEN in .env (shared with workers)}
+      VMP_PACKAGER_SECRET: ${VMP_PACKAGER_SECRET:?Set VMP_PACKAGER_SECRET in .env (base64url)}
+      VMP_WEBHOOK_SECRET: ${VMP_WEBHOOK_SECRET:?Set VMP_WEBHOOK_SECRET in .env}
+      VMP_SUPERVISOR_DASHBOARD_SECRET: ${VMP_SUPERVISOR_DASHBOARD_SECRET:?Set VMP_SUPERVISOR_DASHBOARD_SECRET in .env}
+      VMP_API_BASE_URL: ${VMP_API_BASE_URL:?Set VMP_API_BASE_URL in .env}
+      VMP_API_PIPELINE_SECRET: ${VMP_API_PIPELINE_SECRET:?Set VMP_API_PIPELINE_SECRET in .env}
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-b2}
+      PACKAGE_OUTPUT_FOLDER: ${PACKAGE_OUTPUT_FOLDER:?Set PACKAGE_OUTPUT_FOLDER=s3://bucket/videos}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-${B2_S3_ENDPOINT:?Set S3_ENDPOINT_URL or B2_S3_ENDPOINT}}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-${B2_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID or B2_ACCESS_KEY_ID}}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-${B2_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY or B2_SECRET_ACCESS_KEY}}
+      AWS_REGION: ${AWS_REGION:-${B2_REGION:-auto}}
+    volumes:
+      - ${ENCORE_MEDIA_MOUNT:-/mnt}:/media
+    stop_grace_period: 45s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'node -e "fetch(''http://127.0.0.1:8788/health'').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  encore-packager:
+    image: eyevinntechnology/encore-packager:latest
+    restart: unless-stopped
+    networks: [vmp-media]
+    depends_on:
+      redis:
+        condition: service_healthy
+      vmp-supervisor:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_QUEUE: ${REDIS_QUEUE:-packaging-queue}
+      CALLBACK_URL: ${PACKAGER_CALLBACK_URL:-http://vmp:${VMP_PACKAGER_SECRET:?Set VMP_PACKAGER_SECRET}@vmp-supervisor:8788/vmp/api}
+      PACKAGE_OUTPUT_FOLDER: ${PACKAGE_OUTPUT_FOLDER:?Set PACKAGE_OUTPUT_FOLDER=s3://bucket/videos}
+      # $$ escapes Compose interpolation → packager sees $EXTERNALID$.
+      OUTPUT_SUBFOLDER_TEMPLATE: ${OUTPUT_SUBFOLDER_TEMPLATE:-/$$EXTERNALID$$}
+      HLS_MANIFEST_NAME_TEMPLATE: ${HLS_MANIFEST_NAME_TEMPLATE:-master.m3u8}
+      # Shaka segment length must match Encore GOP (60 frames @ 30fps = 2s).
+      PACKAGE_FORMAT_OPTIONS_JSON: ${PACKAGE_FORMAT_OPTIONS_JSON:-{"segmentDuration":2}}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-${B2_S3_ENDPOINT:?Set S3_ENDPOINT_URL or B2_S3_ENDPOINT}}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-${B2_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID or B2_ACCESS_KEY_ID}}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-${B2_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY or B2_SECRET_ACCESS_KEY}}
+      AWS_REGION: ${AWS_REGION:-${B2_REGION:-auto}}
+    volumes:
+      - ${ENCORE_MEDIA_MOUNT:-/mnt}:/media
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  tusd:
+    # Resumable uploads → post-finish hook moves the file into the inbox.
+    # Not exposed directly; the supervisor proxies /vmp/uploads → tusd /files
+    # behind the dashboard secret.
+    image: tusproject/tusd:latest
+    restart: unless-stopped
+    networks: [vmp-media]
+    command:
+      - -upload-dir=/media/tus-uploads
+      - -base-path=/files/
+      - -hooks-http=http://vmp:${VMP_PACKAGER_SECRET:?Set VMP_PACKAGER_SECRET}@vmp-supervisor:8788/vmp/api/tus-hook
+      - -hooks-enabled-events=post-finish
+      - -hooks-http-retry=3
+      - -max-size=${TUSD_MAX_SIZE_BYTES:-21474836480}
+    volumes:
+      - ${ENCORE_MEDIA_MOUNT:-/mnt}:/media
+
+  redis-exporter:
+    profiles: [observability]
+    image: oliver006/redis_exporter:latest
+    restart: unless-stopped
+    networks: [vmp-media]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    networks: [vmp-media]
+    ports:
+      - "${PROMETHEUS_BIND:-127.0.0.1}:9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana-oss:latest
+    restart: unless-stopped
+    networks: [vmp-media]
+    ports:
+      - "${GRAFANA_BIND:-127.0.0.1}:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  encore-shared-work:
+  prometheus-data:
+  grafana-data:

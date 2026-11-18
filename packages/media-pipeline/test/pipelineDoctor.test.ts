@@ -1,10 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import {
-  formatDoctorReport,
-  redactUrlCredentials,
-  runPipelineDoctor,
-} from '../pipelineDoctor.js';
+import { formatDoctorReport, redactUrlCredentials, runPipelineDoctor } from '../pipelineDoctor.js';
 
 describe('redactUrlCredentials', () => {
   it('masks userinfo and falls back for invalid URLs', () => {
@@ -38,10 +34,16 @@ describe('pipelineDoctor URL redaction', () => {
     const encoreUrl = report.findings.find((f) => f.id === 'encore.url');
     const endpoint = report.findings.find((f) => f.id === 'storage.endpoint');
     assert.equal(encoreUrl?.severity, 'ok');
-    assert.match(encoreUrl?.message ?? '', /ENCORE_BASE_URL=http:\/\/\*\*\*:\*\*\*@127\.0\.0\.1:8080\/?/);
+    assert.match(
+      encoreUrl?.message ?? '',
+      /ENCORE_BASE_URL=http:\/\/\*\*\*:\*\*\*@127\.0\.0\.1:8080\/?/,
+    );
     assert.doesNotMatch(encoreUrl?.message ?? '', /encore-secret/);
     assert.equal(endpoint?.severity, 'ok');
-    assert.match(endpoint?.message ?? '', /S3 endpoint https:\/\/\*\*\*:\*\*\*@s3\.example\.com\/?/);
+    assert.match(
+      endpoint?.message ?? '',
+      /S3 endpoint https:\/\/\*\*\*:\*\*\*@s3\.example\.com\/?/,
+    );
     assert.doesNotMatch(endpoint?.message ?? '', /endpoint-secret/);
   });
 });
@@ -88,7 +90,10 @@ describe('pipelineDoctor', () => {
     });
     const packagerUrl = report.findings.find((f) => f.id === 'encore.packager_url');
     assert.equal(packagerUrl?.severity, 'ok');
-    assert.match(packagerUrl?.message ?? '', /PACKAGER_ENCORE_BASE_URL=http:\/\/\*\*\*:\*\*\*@encore-web:8080\/?/);
+    assert.match(
+      packagerUrl?.message ?? '',
+      /PACKAGER_ENCORE_BASE_URL=http:\/\/\*\*\*:\*\*\*@encore-web:8080\/?/,
+    );
     assert.doesNotMatch(packagerUrl?.message ?? '', /super-secret/);
   });
 

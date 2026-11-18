@@ -4,6 +4,7 @@
  */
 
 import { createClient } from 'redis';
+import type { AggregateJobRecord } from './encoreAggregate.js';
 import type { PackagingStage, PipelineMode } from './pipelineMode.js';
 
 export type PackagingJobRecord = {
@@ -16,6 +17,11 @@ export type PackagingJobRecord = {
   outputPath?: string;
   error?: string;
   updatedAt: string;
+  /**
+   * Set for rendition-split packaging: the packager fetches this job's URL on
+   * the supervisor and receives a merged Encore job built from memberJobIds.
+   */
+  aggregate?: Pick<AggregateJobRecord, 'inputUri' | 'memberJobIds'>;
 };
 
 /** Match supervisor MAX_PIPELINE_SUCCESS_JOBS retention. */

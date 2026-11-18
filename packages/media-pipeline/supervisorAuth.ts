@@ -27,12 +27,21 @@ export function isPackagerCallbackPath(pathname: string, method: string): boolea
   return method === 'POST' && /^\/vmp\/api\/packagerCallback\/(success|failure)$/.test(pathname);
 }
 
+/** Worker heartbeat + packager-facing aggregate job doc — verified per-route. */
+export function isPipelineServicePath(pathname: string, method: string): boolean {
+  if (method === 'POST' && pathname === '/api/workers/heartbeat') return true;
+  if (method === 'GET' && /^\/vmp\/api\/encoreJobAggregate\/[^/]+$/.test(pathname)) return true;
+  if (method === 'POST' && pathname === '/vmp/api/tus-hook') return true;
+  return false;
+}
+
 /** Routes that use their own secrets (webhooks, packaging, packager callbacks). */
 export function isExternallyAuthenticatedPath(pathname: string, method: string): boolean {
   return (
     isWebhookPath(pathname, method) ||
     isPackagingApiPath(pathname, method) ||
-    isPackagerCallbackPath(pathname, method)
+    isPackagerCallbackPath(pathname, method) ||
+    isPipelineServicePath(pathname, method)
   );
 }
 
@@ -43,6 +52,9 @@ export function isExternallyAuthenticatedPath(pathname: string, method: string):
 export function requiresDashboardAuth(pathname: string, method: string): boolean {
   if (pathname === '/' && method === 'GET') return false;
   if (pathname === '/health' && method === 'GET') return false;
+  if (pathname === '/metrics' && method === 'GET') return false;
+  // CORS preflights for tus uploads carry no credentials — answer them publicly.
+  if (method === 'OPTIONS' && pathname.startsWith('/vmp/uploads')) return false;
   if (isExternallyAuthenticatedPath(pathname, method)) return false;
   return true;
 }

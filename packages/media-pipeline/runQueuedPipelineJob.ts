@@ -5,17 +5,24 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { AGGREGATE_JOB_PATH_PREFIX, aggregateJobIdFor } from './encoreAggregate.js';
 import {
   checkEncoreHealth,
   encoreJobUrl,
   encoreSegmentLengthSeconds,
-  resolveEncoreProfileName,
+  resolveEncoreProfile,
   submitEncoreJob,
+  submitRenditionJobs,
+  toEncoreUri,
   waitForEncoreJob,
 } from './encoreClient.js';
-import { ENCORE_JOB_PRIORITY } from './encorePriorities.js';
-import { detectGpuEncodeConfig } from './gpuDetect.js';
-import { registerAndEnqueuePackaging, waitForPackaging } from './packagingClient.js';
+import { ENCORE_JOB_PRIORITY, encorePriorityFor } from './encorePriorities.js';
+import { resolveSubmitBackend } from './gpuDetect.js';
+import {
+  registerAndEnqueuePackaging,
+  supervisorBaseUrl,
+  waitForPackaging,
+} from './packagingClient.js';
 import type { PackagingStage, PipelineMode, QueuedPipelineSubStage } from './pipelineMode.js';
 import { objectKey, uploadFileToStorage } from './storage.js';
 import { emitTtp, type TtpMilestone } from './ttpLog.js';
@@ -71,29 +78,37 @@ async function findNewestAudio(outputDir: string): Promise<string> {
   return best.path;
 }
 
+function ladderSplitMode(): 'job' | 'renditions' {
+  return (process.env.VMP_LADDER_SPLIT || 'job').trim().toLowerCase() === 'renditions'
+    ? 'renditions'
+    : 'job';
+}
+
 async function runEncoreAndPackage(
   ctx: QueuedPipelineContext,
   options: {
     profileBase: string;
     stage: PackagingStage;
     outputSubdir: string;
-    priority?: number;
+    kind: 'fast_lane' | 'full_ladder';
     duration?: number;
     ttpEncodeStart: TtpMilestone;
     ttpEncodeDone: TtpMilestone;
   },
 ): Promise<string> {
-  const profile = await resolveEncoreProfileName(options.profileBase);
+  const { profile, backend, queueClass } = await resolveEncoreProfile(options.profileBase);
   const outDir = path.join(ctx.tmpDir, 'encore', options.outputSubdir);
   await mkdir(outDir, { recursive: true });
   const baseName = `vmp-${ctx.videoId}-${options.outputSubdir}`;
+  const priority = encorePriorityFor(options.kind, queueClass);
 
   await emitTtp(ctx.videoId, options.ttpEncodeStart, {
     pipelineMode: ctx.pipelineMode,
     profile,
+    gpuBackend: backend,
     packagingStage: options.stage,
   });
-  ctx.emitStage(options.stage, 'encode', 'active', `encore profile=${profile}`);
+  ctx.emitStage(options.stage, 'encode', 'active', `encore profile=${profile} backend=${backend}`);
 
   const jobId = await submitEncoreJob({
     profile,
@@ -101,7 +116,7 @@ async function runEncoreAndPackage(
     outputFolder: outDir,
     baseName,
     externalId: ctx.videoId,
-    priority: options.priority ?? 50,
+    priority,
     duration: options.duration,
     segmentLength: encoreSegmentLengthSeconds(),
   });
@@ -133,6 +148,56 @@ async function runEncoreAndPackage(
   return jobId;
 }
 
+/**
+ * Rendition-split ladder (VMP_LADDER_SPLIT=renditions): one Encore job per
+ * resolution so independent workers can take 1080p/720p/480p in parallel.
+ * The packager consumes a merged job document served by the supervisor.
+ */
+async function runRenditionSplitLadder(
+  ctx: QueuedPipelineContext,
+  options: {
+    stage: PackagingStage;
+    ttpEncodeStart: TtpMilestone;
+    ttpEncodeDone: TtpMilestone;
+  },
+): Promise<void> {
+  await emitTtp(ctx.videoId, options.ttpEncodeStart, {
+    pipelineMode: ctx.pipelineMode,
+    ladderSplit: 'renditions',
+    packagingStage: options.stage,
+  });
+  ctx.emitStage(options.stage, 'encode', 'active', 'encore renditions split');
+  const jobs = await submitRenditionJobs({
+    videoId: ctx.videoId,
+    inputPath: ctx.inputPath,
+    outputDir: ctx.tmpDir,
+    isCancelled: ctx.isCancelled,
+  });
+  await emitTtp(ctx.videoId, options.ttpEncodeDone, {
+    pipelineMode: ctx.pipelineMode,
+    encoreJobIds: jobs.map((j) => j.jobId).join(','),
+  });
+
+  const jobId = aggregateJobIdFor(ctx.videoId);
+  const encoreJobUrl = `${supervisorBaseUrl()}${AGGREGATE_JOB_PATH_PREFIX}${encodeURIComponent(jobId)}`;
+  await registerAndEnqueuePackaging({
+    jobId,
+    encoreJobUrl,
+    videoId: ctx.videoId,
+    stage: options.stage,
+    pipelineMode: ctx.pipelineMode,
+    aggregate: {
+      inputUri: toEncoreUri(ctx.inputPath),
+      memberJobIds: jobs.map((j) => j.jobId),
+    },
+  });
+  ctx.emitStage(options.stage, 'package', 'active', 'packaging queued');
+  const pkg = await waitForPackaging(jobId);
+  if (pkg.status === 'failed') {
+    throw new Error(pkg.error || `packaging failed for ${jobId}`);
+  }
+}
+
 async function runPodcastSidecars(ctx: QueuedPipelineContext): Promise<void> {
   if (!ctx.hasAudio) {
     await emitTtp(ctx.videoId, 'podcast_mp3_skipped', { pipelineMode: ctx.pipelineMode });
@@ -148,7 +213,7 @@ async function runPodcastSidecars(ctx: QueuedPipelineContext): Promise<void> {
   const podcastOut = path.join(ctx.tmpDir, 'encore', 'podcast');
   await mkdir(podcastOut, { recursive: true });
   const podcastJobId = await submitEncoreJob({
-    profile: await resolveEncoreProfileName('vmp-podcast-mp3'),
+    profile: (await resolveEncoreProfile('vmp-podcast-mp3')).profile,
     inputPath: ctx.inputPath,
     outputFolder: podcastOut,
     baseName: `vmp-${ctx.videoId}-podcast`,
@@ -172,7 +237,7 @@ async function runPodcastSidecars(ctx: QueuedPipelineContext): Promise<void> {
   const previewOut = path.join(ctx.tmpDir, 'encore', 'preview');
   await mkdir(previewOut, { recursive: true });
   const previewJobId = await submitEncoreJob({
-    profile: await resolveEncoreProfileName('vmp-podcast-preview'),
+    profile: (await resolveEncoreProfile('vmp-podcast-preview')).profile,
     inputPath: ctx.inputPath,
     outputFolder: previewOut,
     baseName: `vmp-${ctx.videoId}-preview`,
@@ -195,19 +260,38 @@ async function runPodcastSidecars(ctx: QueuedPipelineContext): Promise<void> {
 
 export async function runQueuedPipelineJob(ctx: QueuedPipelineContext): Promise<void> {
   await checkEncoreHealth();
-  const gpu = await detectGpuEncodeConfig();
+  const backend = await resolveSubmitBackend();
   await emitTtp(ctx.videoId, 'gpu_backend_detected', {
     pipelineMode: ctx.pipelineMode,
-    gpuBackend: gpu.backend,
-    profileSuffix: gpu.profileSuffix,
+    gpuBackend: backend,
+    profileSuffix: backend === 'cpu' ? '' : `-gpu-${backend}`,
+    workerFleet: true,
   });
+
+  const runLadder = () => {
+    if (ladderSplitMode() === 'renditions') {
+      return runRenditionSplitLadder(ctx, {
+        stage: 'full_ladder',
+        ttpEncodeStart: 'phase2_encode_start',
+        ttpEncodeDone: 'phase2_encode_done',
+      });
+    }
+    return runEncoreAndPackage(ctx, {
+      profileBase: 'vmp-full-ladder',
+      stage: 'full_ladder',
+      outputSubdir: 'full-ladder',
+      kind: 'full_ladder',
+      ttpEncodeStart: 'phase2_encode_start',
+      ttpEncodeDone: 'phase2_encode_done',
+    });
+  };
 
   if (ctx.pipelineMode === 'fast_lane') {
     await runEncoreAndPackage(ctx, {
       profileBase: 'vmp-720p-audio',
       stage: 'fast_lane_preview',
       outputSubdir: 'fast-lane-720p',
-      priority: ENCORE_JOB_PRIORITY.FAST_LANE_720P,
+      kind: 'fast_lane',
       ttpEncodeStart: 'phase1_encode_start',
       ttpEncodeDone: 'phase1_encode_done',
     });
@@ -229,14 +313,7 @@ export async function runQueuedPipelineJob(ctx: QueuedPipelineContext): Promise<
       });
     });
 
-    const ladderTask = runEncoreAndPackage(ctx, {
-      profileBase: 'vmp-full-ladder',
-      stage: 'full_ladder',
-      outputSubdir: 'full-ladder',
-      priority: ENCORE_JOB_PRIORITY.FULL_LADDER,
-      ttpEncodeStart: 'phase2_encode_start',
-      ttpEncodeDone: 'phase2_encode_done',
-    }).then(async () => {
+    const ladderTask = runLadder().then(async () => {
       await emitTtp(ctx.videoId, 'phase2_upload_done', {
         pipelineMode: ctx.pipelineMode,
         via: 'encore-packager',
@@ -261,14 +338,7 @@ export async function runQueuedPipelineJob(ctx: QueuedPipelineContext): Promise<
     });
   });
 
-  await runEncoreAndPackage(ctx, {
-    profileBase: 'vmp-full-ladder',
-    stage: 'full_ladder',
-    outputSubdir: 'full-ladder',
-    priority: ENCORE_JOB_PRIORITY.FULL_LADDER,
-    ttpEncodeStart: 'phase2_encode_start',
-    ttpEncodeDone: 'phase2_encode_done',
-  });
+  await runLadder();
   await emitTtp(ctx.videoId, 'phase2_upload_done', {
     pipelineMode: ctx.pipelineMode,
     via: 'encore-packager',
