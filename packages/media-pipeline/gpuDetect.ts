@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { access } from 'node:fs/promises';
-import { liveWorkerBackends } from './workerRegistry.js';
+import { liveWorkerBackendCounts } from './workerRegistry.js';
 
 export type GpuBackend = 'cpu' | 'vaapi' | 'nvenc';
 
@@ -120,10 +120,25 @@ export async function resolveSubmitBackend(): Promise<GpuBackend> {
   if (FORCE_GPU === 'vaapi') return 'vaapi';
   if (FORCE_GPU === 'cpu' || FORCE_GPU === 'none') return 'cpu';
 
-  const backends = await liveWorkerBackends();
-  if (backends.has('nvenc')) return 'nvenc';
-  if (backends.has('vaapi')) return 'vaapi';
-  return 'cpu';
+  const counts = await liveWorkerBackendCounts();
+  // shortcut: Encore exposes one GPU queue class, so a vaapi-profile job pulled
+  // by an nvenc-only worker fails. Mixed GPU fleets are not routable today —
+  // submit to the majority backend; upgrade = per-backend worker queues.
+  if (counts.size > 1) {
+    process.stderr.write(
+      `[gpu-detect] mixed GPU fleet (${[...counts].map(([b, n]) => `${b}:${n}`).join(', ')}) — routing to majority backend\n`,
+    );
+  }
+  let best: GpuBackend = 'cpu';
+  let bestN = 0;
+  for (const backend of ['nvenc', 'vaapi'] as const) {
+    const n = counts.get(backend) ?? 0;
+    if (n > bestN) {
+      best = backend;
+      bestN = n;
+    }
+  }
+  return best;
 }
 
 export function gpuProfileSuffixFor(backend: GpuBackend): GpuEncodeConfig['profileSuffix'] {

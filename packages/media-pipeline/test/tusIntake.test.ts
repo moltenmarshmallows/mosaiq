@@ -38,7 +38,11 @@ describe('planTusIntake', () => {
         event: {
           upload: {
             id: 'upload-1',
-            meta_data: { filename: 'my movie.mp4', videoId: 'vid-9', pipelineMode: 'full_ladder' },
+            meta_data: {
+              filename: 'my movie.mp4',
+              videoId: '550e8400-e29b-41d4-a716-446655440009',
+              pipelineMode: 'full_ladder',
+            },
             storage: { type: 'filestore', path: src },
           },
         },
@@ -46,7 +50,7 @@ describe('planTusIntake', () => {
       envWith(dir),
     );
     assert.equal(plan?.pipelineMode, 'full_ladder');
-    assert.equal(plan?.destPath, `${dir}/inbox-full/vid-9.mp4`);
+    assert.equal(plan?.destPath, `${dir}/inbox-full/550e8400-e29b-41d4-a716-446655440009.mp4`);
   });
 
   it('accepts native tusd capitalization (Type/Event.Upload/MetaData/Storage)', () => {
@@ -59,15 +63,38 @@ describe('planTusIntake', () => {
         Event: {
           Upload: {
             ID: 'upload-2',
-            MetaData: { filename: 'clip.mp4', videoId: 'vid-10' },
+            MetaData: { filename: 'clip.mp4', videoId: '550e8400-e29b-41d4-a716-446655440010' },
             Storage: { Type: 'filestore', Path: src },
           },
         },
       },
       envWith(dir),
     );
-    assert.equal(plan?.videoIdHint, 'vid-10');
-    assert.equal(plan?.destBasename, 'vid-10.mp4');
+    assert.equal(plan?.videoIdHint, '550e8400-e29b-41d4-a716-446655440010');
+    assert.equal(plan?.destBasename, '550e8400-e29b-41d4-a716-446655440010.mp4');
+  });
+
+  it('rejects non-UUID videoId hints the watcher would rename', () => {
+    const dir = tmpDir();
+    const src = path.join(dir, 'upload-x');
+    fs.writeFileSync(src, 'x');
+    assert.throws(
+      () =>
+        planTusIntake(
+          {
+            Type: 'post-finish',
+            Event: {
+              Upload: {
+                ID: 'upload-x',
+                MetaData: { filename: 'clip.mp4', videoId: 'vid-10' },
+                Storage: { Type: 'filestore', Path: src },
+              },
+            },
+          },
+          envWith(dir),
+        ),
+      /unsupported videoId hint/,
+    );
   });
 
   it('suffixes the upload id when no videoId hint is given', () => {

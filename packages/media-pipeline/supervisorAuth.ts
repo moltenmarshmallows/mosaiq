@@ -94,6 +94,19 @@ export function verifyDashboardSecret(req: IncomingMessage, dashboardSecret: str
  * (`http://user:password@host/path`). We also accept `x-vmp-pipeline-secret`
  * for manual/testing clients.
  */
+/** Password half of the request's `Authorization: Basic` credentials, if any. */
+export function extractBasicAuthPassword(req: IncomingMessage): string | null {
+  const auth = req.headers.authorization;
+  if (typeof auth !== 'string' || !auth.startsWith('Basic ')) return null;
+  try {
+    const decoded = Buffer.from(auth.slice('Basic '.length).trim(), 'base64').toString('utf8');
+    const colon = decoded.indexOf(':');
+    return colon >= 0 ? decoded.slice(colon + 1) : decoded;
+  } catch {
+    return null;
+  }
+}
+
 export function verifyPackagerCallbackSecret(
   req: IncomingMessage,
   packagerSecret: string,
@@ -106,16 +119,9 @@ export function verifyPackagerCallbackSecret(
     return timingSafeEqualString(fromHeader, packagerSecret);
   }
 
-  const auth = req.headers.authorization;
-  if (typeof auth === 'string' && auth.startsWith('Basic ')) {
-    try {
-      const decoded = Buffer.from(auth.slice('Basic '.length).trim(), 'base64').toString('utf8');
-      const colon = decoded.indexOf(':');
-      const password = colon >= 0 ? decoded.slice(colon + 1) : decoded;
-      return timingSafeEqualString(password, packagerSecret);
-    } catch {
-      return false;
-    }
+  const password = extractBasicAuthPassword(req);
+  if (password !== null) {
+    return timingSafeEqualString(password, packagerSecret);
   }
 
   return false;

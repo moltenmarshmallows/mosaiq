@@ -39,6 +39,7 @@ import {
 } from './packagingRegistry.js';
 import { formatDoctorReport, runPipelineDoctor } from './pipelineDoctor.js';
 import {
+  extractBasicAuthPassword,
   isLoopbackHost,
   REBUILD_WEBHOOK_PATHS,
   requiresDashboardAuth,
@@ -46,7 +47,7 @@ import {
   verifyDashboardSecret,
   verifyPackagerCallbackSecret,
 } from './supervisorAuth.js';
-import { planTusIntake } from './tusIntake.js';
+import { planTusIntake, tusdDataDir } from './tusIntake.js';
 import {
   listWorkers,
   recordWorkerHeartbeat,
@@ -241,35 +242,36 @@ function pushLog(line) {
   while (logLines.length > MAX_LOG) logLines.shift();
 }
 
+const STAGE_LABELS: Record<string, string> = {
+  detected: 'Detected in watchfolder',
+  deduped: 'Already processing',
+  wait_upload_complete: 'Waiting for file settle',
+  probe: 'Probe source',
+  phase1_encode: 'Phase 1: encode & package 720p',
+  phase1_upload: 'Phase 1: upload 720p to R2',
+  phase1_available: 'Phase 1: 720p watchable',
+  phase2_encode: 'Phase 2: encode 1080p & 480p',
+  phase2_package: 'Phase 2: package multi-rendition HLS',
+  phase2_upload: 'Phase 2: upload renditions to R2',
+  phase2_manifest_swap: 'Phase 2: swap master manifest',
+  multi_rendition_ready: 'All renditions ready',
+  encode: 'Re-encoding renditions',
+  podcast_mp3: 'Encoding podcast MP3',
+  package_hls: 'Packaging HLS',
+  upload_assets: 'Uploading assets to R2',
+  preview_wait: 'Waiting preview lock',
+  preview_render: 'Encoding preview MP3',
+  preview_upload: 'Uploading preview MP3',
+  cleanup: 'Cleanup',
+  done: 'Done',
+  failed: 'Failed',
+  paused: 'Paused',
+  resumed: 'Resumed',
+  stopped: 'Stopped',
+};
+
 function stageLabel(stage) {
-  const labels = {
-    detected: 'Detected in watchfolder',
-    deduped: 'Already processing',
-    wait_upload_complete: 'Waiting for file settle',
-    probe: 'Probe source',
-    phase1_encode: 'Phase 1: encode & package 720p',
-    phase1_upload: 'Phase 1: upload 720p to R2',
-    phase1_available: 'Phase 1: 720p watchable',
-    phase2_encode: 'Phase 2: encode 1080p & 480p',
-    phase2_package: 'Phase 2: package multi-rendition HLS',
-    phase2_upload: 'Phase 2: upload renditions to R2',
-    phase2_manifest_swap: 'Phase 2: swap master manifest',
-    multi_rendition_ready: 'All renditions ready',
-    encode: 'Re-encoding renditions',
-    podcast_mp3: 'Encoding podcast MP3',
-    package_hls: 'Packaging HLS',
-    upload_assets: 'Uploading assets to R2',
-    preview_wait: 'Waiting preview lock',
-    preview_render: 'Encoding preview MP3',
-    preview_upload: 'Uploading preview MP3',
-    cleanup: 'Cleanup',
-    done: 'Done',
-    failed: 'Failed',
-    paused: 'Paused',
-    resumed: 'Resumed',
-    stopped: 'Stopped',
-  };
-  return labels[stage] || stage;
+  return STAGE_LABELS[stage] || stage;
 }
 
 function sortJobQueue(): void {
@@ -1545,12 +1547,16 @@ const server = http.createServer(async (req, res) => {
     if (packagerJobUrl !== reg.encoreJobUrl) {
       pushLog(`packaging rewrite encoreJobUrl ${reg.encoreJobUrl} → ${packagerJobUrl}`);
     }
-    // Aggregate URLs are fetched by the packager; embed Basic-auth credentials
-    // (verified like packager callbacks) since the packager sends no headers.
+    // Aggregate URLs are fetched by the packager, which sends no headers —
+    // embed a one-shot per-job token rather than the master secret so the
+    // credential persisted in Redis (registry + queue message) is scoped to
+    // this job only.
+    let aggregateToken: string | undefined;
     if (reg.aggregate) {
+      aggregateToken = crypto.randomUUID();
       const parsed = new URL(packagerJobUrl);
       parsed.username = 'vmp';
-      parsed.password = packagerSecret || '';
+      parsed.password = aggregateToken;
       packagerJobUrl = parsed.toString();
     }
     await registerPackagingJob({
@@ -1567,6 +1573,7 @@ const server = http.createServer(async (req, res) => {
               : [],
           }
         : undefined,
+      aggregateToken,
     });
     try {
       await enqueuePackagerJob(String(reg.jobId), packagerJobUrl);
@@ -1686,13 +1693,20 @@ const server = http.createServer(async (req, res) => {
   // ── Packager-facing aggregate job doc (rendition-split ladders) ────────
   const aggregateMatch = url.pathname.match(/^\/vmp\/api\/encoreJobAggregate\/([^/]+)$/);
   if (req.method === 'GET' && aggregateMatch) {
-    if (!verifyPackagerCallbackSecret(req, packagerSecret || '')) {
-      json(res, { error: 'Unauthorized' }, 401);
-      return;
-    }
     const record = await getPackagingJob(decodeURIComponent(aggregateMatch[1]));
     if (!record?.aggregate) {
       json(res, { error: 'Not found' }, 404);
+      return;
+    }
+    // The packager authenticates with the per-job token embedded in its copy
+    // of encoreJobUrl — not the shared packager secret.
+    const password = extractBasicAuthPassword(req);
+    if (
+      !record.aggregateToken ||
+      !password ||
+      !timingSafeEqualString(password, record.aggregateToken)
+    ) {
+      json(res, { error: 'Unauthorized' }, 401);
       return;
     }
     try {
@@ -1933,14 +1947,24 @@ async function buildMetricsText(): Promise<string> {
     const stage = String(job.stage || 'unknown');
     stageCounts.set(stage, (stageCounts.get(stage) || 0) + 1);
   }
-  for (const [stage, count] of stageCounts)
-    g('pipeline_active_jobs', count, `stage="${esc(stage)}"`);
+  // Emit every known stage (zero included) so graphs don't go stale when the
+  // last job leaves a stage.
+  for (const stage of Object.keys(STAGE_LABELS)) {
+    g('pipeline_active_jobs', stageCounts.get(stage) ?? 0, `stage="${esc(stage)}"`);
+  }
+  for (const [stage, count] of stageCounts) {
+    if (!(stage in STAGE_LABELS)) g('pipeline_active_jobs', count, `stage="${esc(stage)}"`);
+  }
   g('pipeline_jobs_failed_total', failedPipelineJobs.length);
   g('pipeline_jobs_success_total', pipelineSuccessfulJobs.length);
 
   const workers = await listWorkers();
   const byBackend = new Map<string, number>();
   for (const w of workers) byBackend.set(w.gpuBackend, (byBackend.get(w.gpuBackend) || 0) + 1);
+  for (const backend of ['cpu', 'nvenc', 'vaapi']) {
+    g('workers', byBackend.get(backend) ?? 0, `backend="${esc(backend)}"`);
+    byBackend.delete(backend);
+  }
   for (const [backend, count] of byBackend) g('workers', count, `backend="${esc(backend)}"`);
   g('workers_total', workers.length);
 
@@ -1959,19 +1983,27 @@ async function buildMetricsText(): Promise<string> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
-    const r = await fetch(`${ENCORE_BASE}/queueCount`, { signal: controller.signal });
-    clearTimeout(timer);
-    if (r.ok) {
-      encoreUp = 1;
-      const data = (await r.json()) as unknown;
-      const counts = Array.isArray(data)
-        ? data
-        : data && typeof data === 'object'
-          ? Object.values(data as Record<string, unknown>)
-          : [];
-      counts.forEach((v, i) => {
-        if (typeof v === 'number') g('encore_queue_depth', v, `queue="${i}"`);
-      });
+    try {
+      const r = await fetch(`${ENCORE_BASE}/queueCount`, { signal: controller.signal });
+      if (r.ok) {
+        const data = (await r.json()) as unknown;
+        const counts = Array.isArray(data)
+          ? data
+          : data && typeof data === 'object'
+            ? Object.values(data as Record<string, unknown>)
+            : [];
+        // Mark Encore up only once a parseable, non-empty queue map arrived.
+        if (counts.length > 0) {
+          encoreUp = 1;
+          counts.forEach((v, i) => {
+            if (typeof v === 'number') g('encore_queue_depth', v, `queue="${i}"`);
+          });
+        }
+      }
+    } finally {
+      // Timer covers body consumption too — a dead Encore mid-JSON still
+      // reports worker/pipeline/redis metrics via the outer catch.
+      clearTimeout(timer);
     }
   } catch {
     /* encore down */
@@ -1987,6 +2019,54 @@ async function buildMetricsText(): Promise<string> {
   g('process_uptime_seconds', Math.floor(process.uptime()));
   g('process_rss_bytes', process.memoryUsage().rss);
   return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Replays completed tusd uploads whose post-finish hook exhausted retries
+ * while the supervisor was down — the file + .info sidecar sit in
+ * TUSD_DATA_DIR until something moves them into the inbox.
+ */
+async function recoverOrphanedTusUploads(): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(tusdDataDir());
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith('.info')) continue;
+    try {
+      const info = JSON.parse(await fs.promises.readFile(path.join(tusdDataDir(), entry), 'utf8')) as {
+        ID?: string;
+        IsFinal?: boolean;
+        Offset?: number;
+        Size?: number;
+        MetaData?: Record<string, string>;
+        Storage?: { Type?: string; Path?: string };
+      };
+      const complete =
+        info.IsFinal === true || (typeof info.Size === 'number' && info.Offset === info.Size);
+      // Already-consumed uploads leave a stale .info behind — skip quietly.
+      if (!complete || !info.Storage?.Path || !fs.existsSync(info.Storage.Path)) continue;
+      const plan = planTusIntake({
+        Type: 'post-finish',
+        Event: {
+          Upload: {
+            ID: info.ID ?? entry.replace(/\.info$/, ''),
+            MetaData: info.MetaData,
+            Storage: info.Storage,
+          },
+        },
+      });
+      if (!plan) continue;
+      await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      pushLog(`tus recovery: republished orphaned upload ${entry}`);
+    } catch (err) {
+      pushLog(
+        `tus recovery: skipped ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 }
 
 async function bootSupervisor(): Promise<void> {
@@ -2023,6 +2103,7 @@ async function bootSupervisor(): Promise<void> {
     process.exit(1);
   }
   startPipeline();
+  void recoverOrphanedTusUploads();
   setInterval(() => {
     reportSupervisorMetrics();
     if (pipelineChild && !pipelineState.exited && !hasStuckRunningJobs()) {

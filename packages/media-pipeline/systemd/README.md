@@ -1,6 +1,6 @@
 # VMP media host (systemd)
 
-> **Prefer Docker:** run `vmp-supervisor` from [encore/docker-compose.yml](../encore/docker-compose.yml) (`ghcr.io/tojemoc/vmp-media-pipeline`). Use this systemd guide only when you need the supervisor on the host (NVM, custom mounts, or legacy installs).
+> **Prefer Docker:** run the coordinator via [docker-compose.coordinator.yml](../docker-compose.coordinator.yml) and an encode worker via [docker-compose.worker.yml](../docker-compose.worker.yml) (`ghcr.io/moltenmarshmallows/vmp-media-pipeline`). Use this systemd guide only when you need the supervisor on the host (NVM, custom mounts, or legacy installs).
 
 The `vmp-supervisor` unit runs the media-pipeline supervisor: local dashboard, preview MP3 webhook, and the `pipeline_watch` child process.
 

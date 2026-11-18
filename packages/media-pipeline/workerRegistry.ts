@@ -186,6 +186,16 @@ export async function liveWorkerBackends(): Promise<Set<WorkerGpuBackend>> {
   return backends;
 }
 
+/** Live GPU-capable worker counts per backend (cpu excluded). */
+export async function liveWorkerBackendCounts(): Promise<Map<WorkerGpuBackend, number>> {
+  const counts = new Map<WorkerGpuBackend, number>();
+  for (const worker of await listWorkers()) {
+    if (worker.gpuBackend === 'cpu') continue;
+    counts.set(worker.gpuBackend, (counts.get(worker.gpuBackend) ?? 0) + 1);
+  }
+  return counts;
+}
+
 /** Test helper — reset in-memory + redis client state. */
 export async function _resetWorkerRegistryForTests(): Promise<void> {
   memoryWorkers.clear();

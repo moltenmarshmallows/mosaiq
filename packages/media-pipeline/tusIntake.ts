@@ -35,7 +35,9 @@ export type TusIntakePlan = {
   videoIdHint?: string;
 };
 
-const SAFE_ID = /^[a-zA-Z0-9._-]{1,200}$/;
+// Only UUID stems survive the watcher verbatim (it renames anything else to a
+// random VIDEO_ID), so honoring a non-UUID hint would lose the association.
+const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VIDEO_EXT = /\.(mp4|mkv|mov)$/i;
 
 function safeBasename(name: string): string {
@@ -89,7 +91,10 @@ export function planTusIntake(
 
   const pipelineMode: PipelineMode =
     meta.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';
-  const videoIdHint = meta.videoId && SAFE_ID.test(meta.videoId) ? meta.videoId : undefined;
+  if (meta.videoId && !UUID_LIKE.test(meta.videoId)) {
+    throw new Error(`tus hook: unsupported videoId hint ${JSON.stringify(meta.videoId)}`);
+  }
+  const videoIdHint = meta.videoId || undefined;
   // No hint: name by the unique upload id so same-named files can't collide.
   // Bound the stem so the full basename stays under the 255-byte FS limit.
   let destBasename: string;

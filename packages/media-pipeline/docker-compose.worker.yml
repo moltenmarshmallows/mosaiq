@@ -23,7 +23,9 @@
 name: vmp-media-worker
 
 x-worker-env: &worker-env
-  ENCORE_SETTINGS_REDIS_URI: ${WORKER_REDIS_URI:-redis://${VMP_COORDINATOR:-redis}:6379}
+  # Redis requires a password (coordinator sets --requirepass) — same
+  # VMP_REDIS_PASSWORD as the coordinator's .env.
+  ENCORE_SETTINGS_REDIS_URI: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@${VMP_COORDINATOR:-redis}:6379}
   ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
   ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work
   ENCORE_SETTINGS_CONCURRENCY: "2"
@@ -92,7 +94,7 @@ services:
     restart: unless-stopped
     networks: [vmp-media]
     environment:
-      REDIS_URL: ${WORKER_REDIS_URI:-redis://${VMP_COORDINATOR:-redis}:6379}
+      REDIS_URL: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:-}@${VMP_COORDINATOR:-redis}:6379}
       REDIS_QUEUE: ${REDIS_QUEUE:-packaging-queue}
       CALLBACK_URL: ${PACKAGER_CALLBACK_URL:-http://vmp:${VMP_PACKAGER_SECRET:-}@${VMP_COORDINATOR:-vmp-supervisor}:8788/vmp/api}
       PACKAGE_OUTPUT_FOLDER: ${PACKAGE_OUTPUT_FOLDER:-}

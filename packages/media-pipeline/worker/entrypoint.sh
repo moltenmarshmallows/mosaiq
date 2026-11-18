@@ -60,14 +60,20 @@ echo "worker=$WORKER_ID backend=$GPU_BACKEND pollQueue=$ENCORE_SETTINGS_POLL_QUE
 heartbeat_loop() {
   [ -n "${VMP_WORKER_TOKEN:-}" ] || { echo "heartbeat: VMP_WORKER_TOKEN unset — not registering" >&2; return; }
   while true; do
-    curl -sf -m 5 -X POST "$SUPERVISOR_URL/api/workers/heartbeat" \
-      -H "x-vmp-worker-token: $VMP_WORKER_TOKEN" -H 'content-type: application/json' \
-      -d "{\"workerId\":\"$WORKER_ID\",\"hostname\":\"$(hostname)\",\"gpuBackend\":\"$GPU_BACKEND\",\"pollQueue\":$ENCORE_SETTINGS_POLL_QUEUE,\"version\":\"${VMP_WORKER_VERSION:-docker}\"}" \
-      >/dev/null 2>&1 || echo "heartbeat: supervisor unreachable" >&2
+    # Register only while an encore-worker process is alive — a worker that
+    # fails at startup must not advertise GPU capacity it cannot use. The
+    # registry TTL drops us once heartbeats stop.
+    if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
+      curl -sf -m 5 -X POST "$SUPERVISOR_URL/api/workers/heartbeat" \
+        -H "x-vmp-worker-token: $VMP_WORKER_TOKEN" -H 'content-type: application/json' \
+        -d "{\"workerId\":\"$WORKER_ID\",\"hostname\":\"$(hostname)\",\"gpuBackend\":\"$GPU_BACKEND\",\"pollQueue\":$ENCORE_SETTINGS_POLL_QUEUE,\"version\":\"${VMP_WORKER_VERSION:-docker}\"}" \
+        >/dev/null 2>&1 || echo "heartbeat: supervisor unreachable" >&2
+    fi
     sleep "$HEARTBEAT_S"
   done
 }
 
+WORKER_PID_FILE="${WORKER_PID_FILE:-/tmp/encore-worker.pid}"
 heartbeat_loop &
 
 worker_pid=""
@@ -81,9 +87,11 @@ while true; do
   set +e
   "$ENCORE_BIN" &
   worker_pid=$!
+  echo "$worker_pid" > "$WORKER_PID_FILE"
   wait "$worker_pid"
   code=$?
   worker_pid=""
+  rm -f "$WORKER_PID_FILE"
   set -e
   echo "worker exited $code; restart in ${IDLE_SLEEP}s" >&2
   sleep "$IDLE_SLEEP"

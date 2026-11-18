@@ -22,6 +22,12 @@ export type PackagingJobRecord = {
    * the supervisor and receives a merged Encore job built from memberJobIds.
    */
   aggregate?: Pick<AggregateJobRecord, 'inputUri' | 'memberJobIds'>;
+  /**
+   * One-shot Basic-auth password embedded in the packager's copy of
+   * encoreJobUrl for aggregate fetches — keeps the master VMP_PACKAGER_SECRET
+   * out of Redis and bounds a leak to this single job.
+   */
+  aggregateToken?: string;
 };
 
 /** Match supervisor MAX_PIPELINE_SUCCESS_JOBS retention. */

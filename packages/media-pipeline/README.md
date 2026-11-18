@@ -28,6 +28,8 @@ Dashboard: `http://127.0.0.1:8788` (secret = `VMP_SUPERVISOR_DASHBOARD_SECRET`).
 
 Every worker registers in the dashboard's **Encode workers** table and immediately adds concurrency. GPU workers drain GPU-class jobs first, then CPU work; CPU workers can never take a GPU-profile job.
 
+> **Credentials on untrusted links:** the supervisor speaks plain HTTP — packager/tusd callbacks (`CALLBACK_URL`, `-hooks-http`) and worker heartbeats carry secrets in URLs/headers. Inside the `vmp-media` network that's fine, but if any callback crosses a host boundary over an untrusted network, put a TLS-terminating reverse proxy in front of the supervisor and point `PACKAGER_CALLBACK_URL`/hooks/`VMP_SUPERVISOR_URL` at `https://…`. Redis is protected by `VMP_REDIS_PASSWORD` but is not encrypted — same rule applies (`WORKER_REDIS_URI` can carry `rediss://` if you tunnel).
+
 ### How capability routing works
 
 Encore's two priority queues become **capability classes** (`encorePriorities.ts`):

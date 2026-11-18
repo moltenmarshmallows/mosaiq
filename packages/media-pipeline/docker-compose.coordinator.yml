@@ -6,6 +6,10 @@
 #
 # Minimal local example (same host):
 #   cp .env.example .env   # fill secrets + B2
+#   mkdir -p "$PWD/media/tus-uploads" "$PWD/media/videos/inbox-fast-lane" \
+#     "$PWD/media/videos/inbox-full-ladder" "$PWD/media/tmp/video_pipeline"
+#   # ^ media dirs must be writable by tusd (uid 1000) and the supervisor's
+#   #   app user — on NFS/other-user ownership, chown/chmod accordingly.
 #   docker compose -f docker-compose.coordinator.yml --env-file .env up -d
 #   docker compose -f docker-compose.worker.yml      --env-file .env up -d
 #
@@ -31,14 +35,20 @@ services:
     image: redis:8.10-alpine
     restart: unless-stopped
     networks: [vmp-media]
-    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      VMP_REDIS_PASSWORD: ${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD in .env}
+    # requirepass is mandatory: remote workers reach this port over LAN.
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$${VMP_REDIS_PASSWORD}"
     volumes:
       - redis-data:/data
     ports:
       # Remote workers need Redis reachable — bind LAN only, not the internet.
       - "${VMP_REDIS_BIND:-127.0.0.1}:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$VMP_REDIS_PASSWORD\" ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -89,8 +99,10 @@ services:
       ENCORE_BASE_URL: http://encore-web:8080
       PACKAGER_ENCORE_BASE_URL: ${PACKAGER_ENCORE_BASE_URL:-http://encore-web:8080}
       # Aggregate (rendition-split) job docs are served BY the supervisor.
-      PACKAGER_SUPERVISOR_BASE_URL: http://vmp-supervisor:8788
-      REDIS_URL: redis://redis:6379
+      PACKAGER_SUPERVISOR_BASE_URL: ${PACKAGER_SUPERVISOR_BASE_URL:-http://vmp-supervisor:8788}
+      REDIS_URL: redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@redis:6379
+      # Enqueue side of the packaging queue — must match the packager's.
+      REDIS_QUEUE: ${REDIS_QUEUE:-packaging-queue}
       MEDIA_HOST_ROOT: /media
       ENCORE_MEDIA_ROOT: /media
       INBOX_FAST_LANE_DIR: ${INBOX_FAST_LANE_DIR:-/media/videos/inbox-fast-lane}
@@ -137,7 +149,7 @@ services:
       vmp-supervisor:
         condition: service_healthy
     environment:
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@redis:6379
       REDIS_QUEUE: ${REDIS_QUEUE:-packaging-queue}
       CALLBACK_URL: ${PACKAGER_CALLBACK_URL:-http://vmp:${VMP_PACKAGER_SECRET:?Set VMP_PACKAGER_SECRET}@vmp-supervisor:8788/vmp/api}
       PACKAGE_OUTPUT_FOLDER: ${PACKAGE_OUTPUT_FOLDER:?Set PACKAGE_OUTPUT_FOLDER=s3://bucket/videos}
@@ -179,6 +191,7 @@ services:
     networks: [vmp-media]
     environment:
       REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${VMP_REDIS_PASSWORD:-}
 
   prometheus:
     profiles: [observability]
