@@ -56,7 +56,9 @@ export function rewriteEncoreJobUrlForPackager(
       throw new Error('Invalid PACKAGER_SUPERVISOR_BASE_URL');
     }
     parsed.protocol = base.protocol;
-    parsed.host = base.host;
+    // host setter keeps the old port when the value lacks one — assign both.
+    parsed.hostname = base.hostname;
+    parsed.port = base.port;
     return parsed.toString();
   }
 
@@ -69,7 +71,8 @@ export function rewriteEncoreJobUrlForPackager(
       throw new Error('Invalid PACKAGER_ENCORE_BASE_URL');
     }
     parsed.protocol = base.protocol;
-    parsed.host = base.host;
+    parsed.hostname = base.hostname;
+    parsed.port = base.port;
     return parsed.toString();
   }
 

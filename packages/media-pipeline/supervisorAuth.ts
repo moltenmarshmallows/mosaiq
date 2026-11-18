@@ -32,6 +32,8 @@ export function isPipelineServicePath(pathname: string, method: string): boolean
   if (method === 'POST' && pathname === '/api/workers/heartbeat') return true;
   if (method === 'GET' && /^\/vmp\/api\/encoreJobAggregate\/[^/]+$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/vmp/api/tus-hook') return true;
+  // API-driven source ingest — HMAC-signed like the rebuild webhook.
+  if (method === 'POST' && pathname === '/vmp/api/ingest') return true;
   return false;
 }
 
@@ -52,7 +54,7 @@ export function isExternallyAuthenticatedPath(pathname: string, method: string):
 export function requiresDashboardAuth(pathname: string, method: string): boolean {
   if (pathname === '/' && method === 'GET') return false;
   if (pathname === '/health' && method === 'GET') return false;
-  if (pathname === '/metrics' && method === 'GET') return false;
+  // /metrics requires the dashboard secret when one is configured.
   // CORS preflights for tus uploads carry no credentials — answer them publicly.
   if (method === 'OPTIONS' && pathname.startsWith('/vmp/uploads')) return false;
   if (isExternallyAuthenticatedPath(pathname, method)) return false;
@@ -92,6 +94,19 @@ export function verifyDashboardSecret(req: IncomingMessage, dashboardSecret: str
  * (`http://user:password@host/path`). We also accept `x-vmp-pipeline-secret`
  * for manual/testing clients.
  */
+/** Password half of the request's `Authorization: Basic` credentials, if any. */
+export function extractBasicAuthPassword(req: IncomingMessage): string | null {
+  const auth = req.headers.authorization;
+  if (typeof auth !== 'string' || !auth.startsWith('Basic ')) return null;
+  try {
+    const decoded = Buffer.from(auth.slice('Basic '.length).trim(), 'base64').toString('utf8');
+    const colon = decoded.indexOf(':');
+    return colon >= 0 ? decoded.slice(colon + 1) : decoded;
+  } catch {
+    return null;
+  }
+}
+
 export function verifyPackagerCallbackSecret(
   req: IncomingMessage,
   packagerSecret: string,
@@ -104,16 +119,9 @@ export function verifyPackagerCallbackSecret(
     return timingSafeEqualString(fromHeader, packagerSecret);
   }
 
-  const auth = req.headers.authorization;
-  if (typeof auth === 'string' && auth.startsWith('Basic ')) {
-    try {
-      const decoded = Buffer.from(auth.slice('Basic '.length).trim(), 'base64').toString('utf8');
-      const colon = decoded.indexOf(':');
-      const password = colon >= 0 ? decoded.slice(colon + 1) : decoded;
-      return timingSafeEqualString(password, packagerSecret);
-    } catch {
-      return false;
-    }
+  const password = extractBasicAuthPassword(req);
+  if (password !== null) {
+    return timingSafeEqualString(password, packagerSecret);
   }
 
   return false;

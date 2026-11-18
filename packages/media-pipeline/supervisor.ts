@@ -26,6 +26,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildAggregateEncoreJobDoc } from './encoreAggregate.js';
 import { getEncoreJob } from './encoreClient.js';
+import { IngestPlanError, planIngest } from './ingestSource.js';
 import { gauge, increment } from './metrics.js';
 import { rewriteEncoreJobUrlForPackager } from './packagerEncoreUrl.js';
 import { enqueuePackagerJob } from './packagingQueue.js';
@@ -38,6 +39,7 @@ import {
 } from './packagingRegistry.js';
 import { formatDoctorReport, runPipelineDoctor } from './pipelineDoctor.js';
 import {
+  extractBasicAuthPassword,
   isLoopbackHost,
   REBUILD_WEBHOOK_PATHS,
   requiresDashboardAuth,
@@ -45,13 +47,14 @@ import {
   verifyDashboardSecret,
   verifyPackagerCallbackSecret,
 } from './supervisorAuth.js';
-import { planTusIntake } from './tusIntake.js';
+import { planTusIntake, tusdDataDir } from './tusIntake.js';
 import {
   listWorkers,
   recordWorkerHeartbeat,
   redisHealthy,
   type WorkerGpuBackend,
 } from './workerRegistry.js';
+import { writeObjectBodyToFile } from './writeObjectBodyToFile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = __dirname;
@@ -84,6 +87,8 @@ const ENCORE_BASE = (process.env.ENCORE_BASE_URL || 'http://127.0.0.1:8080')
   .trim()
   .replace(/\/+$/, '');
 const TUSD_URL = (process.env.TUSD_URL || 'http://tusd:1080').trim().replace(/\/+$/, '');
+/** API origin ingest fetch URLs are allowed to point at (SSRF allowlist). */
+const apiBaseUrl = (process.env.VMP_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const WORKER_BACKENDS = new Set<WorkerGpuBackend>(['nvenc', 'vaapi', 'cpu']);
 
 const uiHost = process.env.VMP_UI_HOST || '127.0.0.1';
@@ -237,35 +242,36 @@ function pushLog(line) {
   while (logLines.length > MAX_LOG) logLines.shift();
 }
 
+const STAGE_LABELS: Record<string, string> = {
+  detected: 'Detected in watchfolder',
+  deduped: 'Already processing',
+  wait_upload_complete: 'Waiting for file settle',
+  probe: 'Probe source',
+  phase1_encode: 'Phase 1: encode & package 720p',
+  phase1_upload: 'Phase 1: upload 720p to R2',
+  phase1_available: 'Phase 1: 720p watchable',
+  phase2_encode: 'Phase 2: encode 1080p & 480p',
+  phase2_package: 'Phase 2: package multi-rendition HLS',
+  phase2_upload: 'Phase 2: upload renditions to R2',
+  phase2_manifest_swap: 'Phase 2: swap master manifest',
+  multi_rendition_ready: 'All renditions ready',
+  encode: 'Re-encoding renditions',
+  podcast_mp3: 'Encoding podcast MP3',
+  package_hls: 'Packaging HLS',
+  upload_assets: 'Uploading assets to R2',
+  preview_wait: 'Waiting preview lock',
+  preview_render: 'Encoding preview MP3',
+  preview_upload: 'Uploading preview MP3',
+  cleanup: 'Cleanup',
+  done: 'Done',
+  failed: 'Failed',
+  paused: 'Paused',
+  resumed: 'Resumed',
+  stopped: 'Stopped',
+};
+
 function stageLabel(stage) {
-  const labels = {
-    detected: 'Detected in watchfolder',
-    deduped: 'Already processing',
-    wait_upload_complete: 'Waiting for file settle',
-    probe: 'Probe source',
-    phase1_encode: 'Phase 1: encode & package 720p',
-    phase1_upload: 'Phase 1: upload 720p to R2',
-    phase1_available: 'Phase 1: 720p watchable',
-    phase2_encode: 'Phase 2: encode 1080p & 480p',
-    phase2_package: 'Phase 2: package multi-rendition HLS',
-    phase2_upload: 'Phase 2: upload renditions to R2',
-    phase2_manifest_swap: 'Phase 2: swap master manifest',
-    multi_rendition_ready: 'All renditions ready',
-    encode: 'Re-encoding renditions',
-    podcast_mp3: 'Encoding podcast MP3',
-    package_hls: 'Packaging HLS',
-    upload_assets: 'Uploading assets to R2',
-    preview_wait: 'Waiting preview lock',
-    preview_render: 'Encoding preview MP3',
-    preview_upload: 'Uploading preview MP3',
-    cleanup: 'Cleanup',
-    done: 'Done',
-    failed: 'Failed',
-    paused: 'Paused',
-    resumed: 'Resumed',
-    stopped: 'Stopped',
-  };
-  return labels[stage] || stage;
+  return STAGE_LABELS[stage] || stage;
 }
 
 function sortJobQueue(): void {
@@ -515,9 +521,9 @@ let pipelineIpcPath: string | null = null;
 let pipelineRestartTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sendPipelineCommand(
-  cmd: 'pause' | 'resume' | 'stop' | 'reorder',
+  cmd: 'pause' | 'resume' | 'stop' | 'reorder' | 'intake',
   videoId?: string,
-  payload?: { order?: string[] },
+  payload?: { order?: string[]; file?: string; inboxDir?: string; pipelineMode?: string },
 ): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
     if (!pipelineIpcPath) {
@@ -547,6 +553,45 @@ function sendPipelineCommand(
     });
     client.on('error', (err) => finish({ ok: false, error: err.message }));
   });
+}
+
+/**
+ * Publish a completed upload into the inbox: hard link (atomic, never
+ * overwrites), then tell the watcher — link() emits no close_write/moved_to
+ * event so inotify alone can't see it. On EEXIST the file was already
+ * accepted: still send intake so a failed job gets requeued while a
+ * queued/running one dedupes inside maybeEnqueueOnce.
+ */
+async function publishToInbox(
+  srcPath: string,
+  destPath: string,
+  pipelineMode: string,
+): Promise<void> {
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+  let published = true;
+  try {
+    await fs.promises.link(srcPath, destPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    // Same inode → src and dest are already the same published file.
+    const [srcStat, destStat] = await Promise.all([
+      fs.promises.stat(srcPath),
+      fs.promises.stat(destPath).catch(() => null),
+    ]);
+    if (destStat && srcStat.dev === destStat.dev && srcStat.ino === destStat.ino) {
+      await fs.promises.rm(srcPath, { force: true });
+    }
+    published = false;
+  }
+  if (published) await fs.promises.rm(srcPath, { force: true });
+  const handoff = await sendPipelineCommand('intake', undefined, {
+    file: path.basename(destPath),
+    inboxDir: path.dirname(destPath),
+    pipelineMode,
+  });
+  if (!handoff.ok) {
+    pushLog(`intake handoff for ${path.basename(destPath)} failed (${handoff.error ?? 'unknown'}) — picked up on next watcher restart scan`);
+  }
 }
 
 function consumeIpcSocketLine(line: string): boolean {
@@ -818,6 +863,22 @@ function verifySignature(rawBody, sigHeader, ts) {
   const a = Buffer.from(m[1], 'hex');
   const b = Buffer.from(expected, 'hex');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/** Shared HMAC+timestamp check for signed webhook POSTs; returns error text or null. */
+function verifySignedWebhookRequest(req: http.IncomingMessage, rawBody: Buffer): string | null {
+  if (!secret) return null;
+  const tsHeader = req.headers['x-vmp-timestamp'];
+  const ts = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
+  const tsNum = Number(ts);
+  if (!ts || !Number.isFinite(tsNum) || tsNum <= 0) return 'Invalid or stale timestamp';
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - tsNum) > 5 * 60) return 'Invalid or stale timestamp';
+  const sig = req.headers['x-vmp-signature'];
+  if (!verifySignature(rawBody, Array.isArray(sig) ? sig[0] : sig, ts)) {
+    return 'Invalid signature';
+  }
+  return null;
 }
 
 function timingSafeEqualString(provided: string, expected: string): boolean {
@@ -1153,7 +1214,7 @@ function dashboardHtml() {
         const workerRows = (d.workers || []).map(w =>
           '<tr><td>' + escapeHtml(w.hostname || w.workerId || '') + '</td><td>' + escapeHtml(w.gpuBackend || '') +
           '</td><td>' + escapeHtml(String(w.pollQueue ?? '')) + '</td><td>' + escapeHtml(w.version || '—') +
-          '</td><td>' + escapeHtml(w.lastSeen || '') + '</td></tr>'
+          '</td><td>' + escapeHtml(w.lastSeenAt || '') + '</td></tr>'
         ).join('')
         document.getElementById('workers').innerHTML = workerRows
           ? '<table><thead><tr><th>Worker</th><th>Backend</th><th>Poll queue</th><th>Version</th><th>Last heartbeat</th></tr></thead><tbody>' + workerRows + '</tbody></table>'
@@ -1269,32 +1330,10 @@ const server = http.createServer(async (req, res) => {
     }
     const rawBody = Buffer.concat(chunks);
 
-    if (secret) {
-      // Validate timestamp freshness
-      const tsHeader = req.headers['x-vmp-timestamp'];
-      const ts = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
-      if (!ts) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-      const tsNum = Number(ts);
-      if (!Number.isFinite(tsNum) || tsNum <= 0) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-      const nowSec = Math.floor(Date.now() / 1000);
-      const skewWindow = 5 * 60; // 5 minutes in seconds
-      if (Math.abs(nowSec - tsNum) > skewWindow) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-
-      // Verify signature
-      const sig = req.headers['x-vmp-signature'];
-      if (!verifySignature(rawBody, Array.isArray(sig) ? sig[0] : sig, ts)) {
-        json(res, { error: 'Invalid signature' }, 401);
-        return;
-      }
+    const webhookAuthError = verifySignedWebhookRequest(req, rawBody);
+    if (webhookAuthError) {
+      json(res, { error: webhookAuthError }, 401);
+      return;
     }
 
     let payload;
@@ -1508,12 +1547,16 @@ const server = http.createServer(async (req, res) => {
     if (packagerJobUrl !== reg.encoreJobUrl) {
       pushLog(`packaging rewrite encoreJobUrl ${reg.encoreJobUrl} → ${packagerJobUrl}`);
     }
-    // Aggregate URLs are fetched by the packager; embed Basic-auth credentials
-    // (verified like packager callbacks) since the packager sends no headers.
+    // Aggregate URLs are fetched by the packager, which sends no headers —
+    // embed a one-shot per-job token rather than the master secret so the
+    // credential persisted in Redis (registry + queue message) is scoped to
+    // this job only.
+    let aggregateToken: string | undefined;
     if (reg.aggregate) {
+      aggregateToken = crypto.randomUUID();
       const parsed = new URL(packagerJobUrl);
       parsed.username = 'vmp';
-      parsed.password = packagerSecret || '';
+      parsed.password = aggregateToken;
       packagerJobUrl = parsed.toString();
     }
     await registerPackagingJob({
@@ -1530,6 +1573,7 @@ const server = http.createServer(async (req, res) => {
               : [],
           }
         : undefined,
+      aggregateToken,
     });
     try {
       await enqueuePackagerJob(String(reg.jobId), packagerJobUrl);
@@ -1649,13 +1693,20 @@ const server = http.createServer(async (req, res) => {
   // ── Packager-facing aggregate job doc (rendition-split ladders) ────────
   const aggregateMatch = url.pathname.match(/^\/vmp\/api\/encoreJobAggregate\/([^/]+)$/);
   if (req.method === 'GET' && aggregateMatch) {
-    if (!verifyPackagerCallbackSecret(req, packagerSecret || '')) {
-      json(res, { error: 'Unauthorized' }, 401);
-      return;
-    }
     const record = await getPackagingJob(decodeURIComponent(aggregateMatch[1]));
     if (!record?.aggregate) {
       json(res, { error: 'Not found' }, 404);
+      return;
+    }
+    // The packager authenticates with the per-job token embedded in its copy
+    // of encoreJobUrl — not the shared packager secret.
+    const password = extractBasicAuthPassword(req);
+    if (
+      !record.aggregateToken ||
+      !password ||
+      !timingSafeEqualString(password, record.aggregateToken)
+    ) {
+      json(res, { error: 'Unauthorized' }, 401);
       return;
     }
     try {
@@ -1689,13 +1740,99 @@ const server = http.createServer(async (req, res) => {
         json(res, { ok: true, ignored: true });
         return;
       }
-      await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
-      await fs.promises.rename(plan.srcPath, plan.destPath);
+      await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
       increment('vmp.tus.upload.accepted', 1, { mode: plan.pipelineMode });
       pushLog(`tus upload → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
       json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
     } catch (err) {
       json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    return;
+  }
+
+  // ── API-driven ingest: pull a raw upload through the video proxy → inbox ──
+  if (req.method === 'POST' && url.pathname === '/vmp/api/ingest') {
+    // This route is exempt from dashboard auth; it must fail closed on HMAC
+    // even when VMP_REQUIRE_WEBHOOK_SECRET=0.
+    if (!secret) {
+      json(res, { error: 'Webhook secret not configured' }, 503);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let byteCount = 0;
+    try {
+      for await (const c of req) {
+        byteCount += c.length;
+        if (byteCount > MAX_BODY_SIZE) {
+          json(res, { error: 'Request body too large' }, 413);
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      }
+    } catch {
+      if (!res.writableEnded && !res.destroyed) {
+        json(res, { error: 'Request body read failed' }, 400);
+      }
+      return;
+    }
+    const rawBody = Buffer.concat(chunks);
+    const authError = verifySignedWebhookRequest(req, rawBody);
+    if (authError) {
+      json(res, { error: authError }, 401);
+      return;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+      json(res, { error: 'Invalid JSON' }, 400);
+      return;
+    }
+    let plan;
+    try {
+      plan = planIngest(payload as Parameters<typeof planIngest>[0], apiBaseUrl);
+    } catch (err) {
+      json(
+        res,
+        {
+          error: err instanceof Error ? err.message : String(err),
+          code: err instanceof IngestPlanError ? err.code : 'invalid_request',
+        },
+        400,
+      );
+      return;
+    }
+    try {
+      const upstream = await fetch(plan.fetchUrl, { redirect: 'error' });
+      if (!upstream.ok || !upstream.body) {
+        // Release the response body before returning — never leak the socket.
+        await upstream.body?.cancel().catch(() => {});
+        json(
+          res,
+          { error: `source fetch failed: HTTP ${upstream.status}`, code: 'source_fetch_failed' },
+          502,
+        );
+        return;
+      }
+      // Stage inside the destination inbox (hidden subdir the non-recursive
+      // watcher can't see) so link() is guaranteed same-filesystem, then
+      // publish atomically — never clobbering a file the watcher accepted.
+      const stagingDir = path.join(path.dirname(plan.destPath), '.ingest-staging');
+      await fs.promises.mkdir(stagingDir, { recursive: true });
+      const staged = path.join(stagingDir, `${plan.destBasename}.${crypto.randomUUID()}`);
+      try {
+        await writeObjectBodyToFile(upstream.body, staged);
+        await publishToInbox(staged, plan.destPath, plan.pipelineMode);
+      } catch (err) {
+        await fs.promises.rm(staged, { force: true }).catch(() => {});
+        throw err;
+      }
+      increment('vmp.ingest.accepted', 1, { mode: plan.pipelineMode });
+      pushLog(`ingest → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
+      json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
+    } catch (err) {
+      json(res, { error: err instanceof Error ? err.message : String(err) }, 502);
     }
     return;
   }
@@ -1810,19 +1947,34 @@ async function buildMetricsText(): Promise<string> {
     const stage = String(job.stage || 'unknown');
     stageCounts.set(stage, (stageCounts.get(stage) || 0) + 1);
   }
-  for (const [stage, count] of stageCounts)
-    g('pipeline_active_jobs', count, `stage="${esc(stage)}"`);
+  // Emit every known stage (zero included) so graphs don't go stale when the
+  // last job leaves a stage.
+  for (const stage of Object.keys(STAGE_LABELS)) {
+    g('pipeline_active_jobs', stageCounts.get(stage) ?? 0, `stage="${esc(stage)}"`);
+  }
+  for (const [stage, count] of stageCounts) {
+    if (!(stage in STAGE_LABELS)) g('pipeline_active_jobs', count, `stage="${esc(stage)}"`);
+  }
   g('pipeline_jobs_failed_total', failedPipelineJobs.length);
   g('pipeline_jobs_success_total', pipelineSuccessfulJobs.length);
 
   const workers = await listWorkers();
   const byBackend = new Map<string, number>();
   for (const w of workers) byBackend.set(w.gpuBackend, (byBackend.get(w.gpuBackend) || 0) + 1);
+  for (const backend of ['cpu', 'nvenc', 'vaapi']) {
+    g('workers', byBackend.get(backend) ?? 0, `backend="${esc(backend)}"`);
+    byBackend.delete(backend);
+  }
   for (const [backend, count] of byBackend) g('workers', count, `backend="${esc(backend)}"`);
   g('workers_total', workers.length);
 
+  const packagerStatusCounts = new Map<string, number>();
   for (const job of listPackagingJobs()) {
-    g('packaging_jobs', 1, `status="${esc(job.status)}"`);
+    const status = String(job.status || 'unknown');
+    packagerStatusCounts.set(status, (packagerStatusCounts.get(status) || 0) + 1);
+  }
+  for (const [status, count] of packagerStatusCounts) {
+    g('packaging_jobs', count, `status="${esc(status)}"`);
   }
 
   g('redis_up', (await redisHealthy()) ? 1 : 0);
@@ -1831,19 +1983,27 @@ async function buildMetricsText(): Promise<string> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
-    const r = await fetch(`${ENCORE_BASE}/queueCount`, { signal: controller.signal });
-    clearTimeout(timer);
-    if (r.ok) {
-      encoreUp = 1;
-      const data = (await r.json()) as unknown;
-      const counts = Array.isArray(data)
-        ? data
-        : data && typeof data === 'object'
-          ? Object.values(data as Record<string, unknown>)
-          : [];
-      counts.forEach((v, i) => {
-        if (typeof v === 'number') g('encore_queue_depth', v, `queue="${i}"`);
-      });
+    try {
+      const r = await fetch(`${ENCORE_BASE}/queueCount`, { signal: controller.signal });
+      if (r.ok) {
+        const data = (await r.json()) as unknown;
+        const counts = Array.isArray(data)
+          ? data
+          : data && typeof data === 'object'
+            ? Object.values(data as Record<string, unknown>)
+            : [];
+        // Mark Encore up only once a parseable, non-empty queue map arrived.
+        if (counts.length > 0) {
+          encoreUp = 1;
+          counts.forEach((v, i) => {
+            if (typeof v === 'number') g('encore_queue_depth', v, `queue="${i}"`);
+          });
+        }
+      }
+    } finally {
+      // Timer covers body consumption too — a dead Encore mid-JSON still
+      // reports worker/pipeline/redis metrics via the outer catch.
+      clearTimeout(timer);
     }
   } catch {
     /* encore down */
@@ -1859,6 +2019,54 @@ async function buildMetricsText(): Promise<string> {
   g('process_uptime_seconds', Math.floor(process.uptime()));
   g('process_rss_bytes', process.memoryUsage().rss);
   return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Replays completed tusd uploads whose post-finish hook exhausted retries
+ * while the supervisor was down — the file + .info sidecar sit in
+ * TUSD_DATA_DIR until something moves them into the inbox.
+ */
+async function recoverOrphanedTusUploads(): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(tusdDataDir());
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith('.info')) continue;
+    try {
+      const info = JSON.parse(await fs.promises.readFile(path.join(tusdDataDir(), entry), 'utf8')) as {
+        ID?: string;
+        IsFinal?: boolean;
+        Offset?: number;
+        Size?: number;
+        MetaData?: Record<string, string>;
+        Storage?: { Type?: string; Path?: string };
+      };
+      const complete =
+        info.IsFinal === true || (typeof info.Size === 'number' && info.Offset === info.Size);
+      // Already-consumed uploads leave a stale .info behind — skip quietly.
+      if (!complete || !info.Storage?.Path || !fs.existsSync(info.Storage.Path)) continue;
+      const plan = planTusIntake({
+        Type: 'post-finish',
+        Event: {
+          Upload: {
+            ID: info.ID ?? entry.replace(/\.info$/, ''),
+            MetaData: info.MetaData,
+            Storage: info.Storage,
+          },
+        },
+      });
+      if (!plan) continue;
+      await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      pushLog(`tus recovery: republished orphaned upload ${entry}`);
+    } catch (err) {
+      pushLog(
+        `tus recovery: skipped ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 }
 
 async function bootSupervisor(): Promise<void> {
@@ -1895,6 +2103,7 @@ async function bootSupervisor(): Promise<void> {
     process.exit(1);
   }
   startPipeline();
+  void recoverOrphanedTusUploads();
   setInterval(() => {
     reportSupervisorMetrics();
     if (pipelineChild && !pipelineState.exited && !hasStuckRunningJobs()) {

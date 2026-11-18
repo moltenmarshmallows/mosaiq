@@ -762,9 +762,10 @@ function scheduleInboxIntake(
   inboxDir: string,
   pipelineMode: PipelineMode,
   mechanism: string,
+  awaitStable = false,
 ): void {
   inboxIntakeChain = inboxIntakeChain
-    .then(() => intakeInboxBasename(file, inboxDir, pipelineMode, mechanism))
+    .then(() => intakeInboxBasename(file, inboxDir, pipelineMode, mechanism, awaitStable))
     .catch((err) => {
       log(
         `inbox intake failed for '${file}' (${inboxDir}): ${err instanceof Error ? err.message : String(err)}`,
@@ -777,6 +778,7 @@ async function intakeInboxBasename(
   inboxDir: string,
   pipelineMode: PipelineMode,
   mechanism: string,
+  awaitStable = false,
 ): Promise<void> {
   if (!isInboxVideoBasename(file)) return;
   const source = `${ingestLabelForMode(pipelineMode)}:${mechanism}`;
@@ -802,6 +804,12 @@ async function intakeInboxBasename(
   }
 
   if (!existsSync(oldPath)) return;
+
+  // Files that appeared without a close_write (moved in while still open,
+  // polling snapshots, startup rescans) may still be written — wait for a
+  // stable size before renaming, otherwise the job would race the writer and
+  // fail. On timeout nothing is renamed, so the next close_write retries it.
+  if (awaitStable) await waitStableSize(oldPath);
 
   const result = await resolveInputTargetPath(stem, ext, oldPath, source);
   inboxIntakeByBasename.set(cacheKey, result);
@@ -837,9 +845,9 @@ function reorderQueue(order: string[]): void {
 }
 
 type IpcCommand = {
-  cmd: 'pause' | 'resume' | 'stop' | 'reorder';
+  cmd: 'pause' | 'resume' | 'stop' | 'reorder' | 'intake';
   videoId?: string;
-  payload?: { order?: string[] };
+  payload?: { order?: string[]; file?: string; inboxDir?: string; pipelineMode?: string };
 };
 
 function handleIpcCommand(raw: string): { ok: boolean; error?: string } {
@@ -869,6 +877,17 @@ function handleIpcCommand(raw: string): { ok: boolean; error?: string } {
     const order = payload?.order;
     if (!Array.isArray(order)) return { ok: false, error: 'missing_order' };
     reorderQueue(order.map(String));
+    return { ok: true };
+  }
+  // Supervisor publishes completed uploads via link() — that emits no
+  // close_write/moved_to, so the watcher needs an explicit nudge. Re-sending
+  // an already-published name is safe: maybeEnqueueOnce dedupes queued/running
+  // jobs and requeues ones that failed.
+  if (cmd === 'intake') {
+    const file = String(payload?.file ?? '');
+    const watch = INBOX_WATCHES.find((w) => w.dir === String(payload?.inboxDir ?? ''));
+    if (!watch || !isInboxVideoBasename(file)) return { ok: false, error: 'invalid_intake' };
+    scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'supervisor_publish');
     return { ok: true };
   }
   return { ok: false, error: 'unknown_cmd' };
@@ -1026,7 +1045,7 @@ async function startupScan(): Promise<void> {
     await mkdir(watch.dir, { recursive: true });
     const entries = await readdir(watch.dir);
     for (const file of entries) {
-      await intakeInboxBasename(file, watch.dir, watch.pipelineMode, 'startup_scan');
+      await intakeInboxBasename(file, watch.dir, watch.pipelineMode, 'startup_scan', true);
     }
   }
   if (queue.length > 0 || running > 0) {
@@ -1041,7 +1060,9 @@ function startWatcherForInbox(watch: InboxWatchConfig) {
     spawn(
       'inotifywait',
       // moved_to: TUS post-finish hook + NAS syncs often rename files into the inbox.
-      ['-m', '-e', 'close_write', '-e', 'moved_to', '--format', '%f', watch.dir],
+      // %e is needed because moved_to alone doesn't prove the writer closed the
+      // file — intake must then wait for a stable size before renaming it.
+      ['-m', '-e', 'close_write', '-e', 'moved_to', '--format', '%e %f', watch.dir],
       {
         env: process.env,
         stdio: ['ignore', 'pipe', 'inherit'],
@@ -1050,9 +1071,15 @@ function startWatcherForInbox(watch: InboxWatchConfig) {
   );
   let stdoutBuffer = '';
   const processLines = (lines: string[]): void => {
-    const unique = [...new Set(lines.filter(Boolean))];
-    for (const file of unique) {
-      scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'watchfolder');
+    const seen = new Set<string>();
+    for (const line of lines.filter(Boolean)) {
+      if (seen.has(line)) continue;
+      seen.add(line);
+      const sp = line.indexOf(' ');
+      if (sp < 0) continue;
+      const event = line.slice(0, sp);
+      const file = line.slice(sp + 1);
+      scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'watchfolder', event === 'MOVED_TO');
     }
   };
   child.stdout.on('data', (chunk) => {
@@ -1095,7 +1122,7 @@ function startPollingWatcher() {
         for (const file of entries) {
           if (known.has(file)) continue;
           if (!isInboxVideoBasename(file)) continue;
-          scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'polling_watchfolder');
+          scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'polling_watchfolder', true);
         }
         knownByInbox.set(watch.dir, current);
       }

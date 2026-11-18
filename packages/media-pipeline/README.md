@@ -28,6 +28,8 @@ Dashboard: `http://127.0.0.1:8788` (secret = `VMP_SUPERVISOR_DASHBOARD_SECRET`).
 
 Every worker registers in the dashboard's **Encode workers** table and immediately adds concurrency. GPU workers drain GPU-class jobs first, then CPU work; CPU workers can never take a GPU-profile job.
 
+> **Credentials on untrusted links:** the supervisor speaks plain HTTP — packager/tusd callbacks (`CALLBACK_URL`, `-hooks-http`) and worker heartbeats carry secrets in URLs/headers. Inside the `vmp-media` network that's fine, but if any callback crosses a host boundary over an untrusted network, put a TLS-terminating reverse proxy in front of the supervisor and point `PACKAGER_CALLBACK_URL`/hooks/`VMP_SUPERVISOR_URL` at `https://…`. Redis is protected by `VMP_REDIS_PASSWORD` but is not encrypted — same rule applies (`WORKER_REDIS_URI` can carry `rediss://` if you tunnel).
+
 ### How capability routing works
 
 Encore's two priority queues become **capability classes** (`encorePriorities.ts`):
@@ -46,11 +48,29 @@ The pipeline asks the worker registry (`workerRegistry.ts`, Redis-backed heartbe
 
 - **Watchfolders** — `INBOX_FAST_LANE_DIR` → fast-lane (720p preview first, then ladder), `INBOX_FULL_LADDER_DIR` → ladder only.
 - **TUS resumable uploads** — `tusd` accepts uploads; the supervisor proxies `/vmp/uploads` (dashboard-secret auth) and `tusd`'s post-finish hook moves completed files into the same inboxes. `meta_data.pipelineMode=full_ladder|fast_lane`, optional `meta_data.videoId`. Clients upload with any tus client to `POST {supervisor}/vmp/uploads` + Bearer dashboard secret.
+- **Remote uploads (B2 hop)** — admins upload browser-direct to B2 at `videos/{id}/source.{ext}` via `@vmp/api` multipart presigning (`POST /api/admin/videos/uploads…`). On completion the API calls `POST /vmp/api/ingest` (HMAC, `VMP_WEBHOOK_SECRET`); the supervisor fetches the file **through the API's `/api/video-proxy`** — B2→Cloudflare egress is free, so testing costs nothing — and drops it into the inbox like a NAS drop. The raw MP4 is playable via the same proxy while HLS encodes; the `fully_processed` callback deletes it.
+
+### B2 bucket setup (one-time, `b2` CLI)
+
+Backblaze isn't in Terraform — configure the bucket once:
+
+```bash
+b2 bucket update "$B2_BUCKET_NAME" allPrivate \
+  --lifecycleRules '[{"fileNamePrefix":"","daysFromStartingToCancelingUnfinishedLargeFiles":7}]' \
+  --corsRules '[{"allowedOrigins":["https://staging.app.mosaiq.video","https://app.mosaiq.video"],"allowedOperations":["s3_put","s3_head","s3_get","s3_delete"],"allowedHeaders":["*"],"exposeHeaders":["ETag"],"maxAgeSeconds":3600}]'
+```
+
+- Lifecycle: `bucket update --lifecycleRules` **replaces** the whole rule list — merge new rules with existing ones (`b2 bucket get`) instead of clobbering them. `daysFromStartingToCancelingUnfinishedLargeFiles` abandons multipart uploads after 7 days (the only leak presigning can leave). Reclaiming completed uploads: add `{"fileNamePrefix":"videos/","daysFromHidingToDeleting":N}` when your retention policy allows it — the `fully_processed` callback deletes current `source.*` objects, but **sweeping current object keys does not remove hidden versions**; only a hide→delete rule or deleting by version ID reclaims that storage.
+- CORS: **required** for the browser PUTs to B2's S3 endpoint and for reading the `ETag` back. If you name the rule (`corsRuleName`) via `b2 update bucket …`, keep the same name on updates or B2 appends a duplicate rule.
 
 ### Observability
 
 - `GET /metrics` on the supervisor — Prometheus exposition: queue depth, active jobs by stage, workers by backend, Encore/Redis health, last TTP, process stats.
-- `docker compose -f docker-compose.coordinator.yml --profile observability` — Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard.
+- Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard. `/metrics` requires `VMP_SUPERVISOR_DASHBOARD_SECRET` when set — create the token file first, then start detached:
+  ```bash
+  printf '%s' "$VMP_SUPERVISOR_DASHBOARD_SECRET" > observability/dashboard-token.txt
+  docker compose -f docker-compose.coordinator.yml --env-file .env --profile observability up -d
+  ```
 - TTP events still land in the TTP JSONL log and DogStatsD (`DD_*`).
 
 ## Environment

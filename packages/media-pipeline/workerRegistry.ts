@@ -38,18 +38,28 @@ type RegistryRedisClient = ReturnType<typeof createRegistryClient>;
 function createRegistryClient() {
   return createClient({
     url: (process.env.REDIS_URL || 'redis://127.0.0.1:6379').trim(),
-    socket: { connectTimeout: 1500 },
+    socket: {
+      connectTimeout: 1500,
+      // No internal reconnect loop — connect() must reject promptly so the
+      // caller can fall back to memory and retry after REDIS_RETRY_COOLDOWN_MS.
+      reconnectStrategy: () => false,
+    },
   });
 }
 
 let redisClient: RegistryRedisClient | null = null;
 let redisConnectPromise: Promise<RegistryRedisClient | null> | null = null;
-let redisDisabled = false;
+// Retry a failed Redis connect after a cooldown instead of latching memory-only.
+let redisRetryAfterMs = 0;
+const REDIS_RETRY_COOLDOWN_MS = 30_000;
 
 const memoryWorkers = new Map<string, WorkerRecord & { expiresAtMs: number }>();
 
 async function getRedis(): Promise<RegistryRedisClient | null> {
-  if (redisDisabled || process.env.VMP_WORKER_REGISTRY_MEMORY_ONLY === '1') {
+  if (
+    Date.now() < redisRetryAfterMs ||
+    process.env.VMP_WORKER_REGISTRY_MEMORY_ONLY === '1'
+  ) {
     return null;
   }
   if (redisClient?.isOpen) return redisClient;
@@ -70,7 +80,7 @@ async function getRedis(): Promise<RegistryRedisClient | null> {
       process.stderr.write(
         `[worker-registry] redis unavailable, memory-only: ${err instanceof Error ? err.message : String(err)}\n`,
       );
-      redisDisabled = true;
+      redisRetryAfterMs = Date.now() + REDIS_RETRY_COOLDOWN_MS;
       return null;
     } finally {
       redisConnectPromise = null;
@@ -129,11 +139,13 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
   const client = await getRedis();
   if (client) {
     try {
-      for await (const key of client.scanIterator({ MATCH: `${REDIS_KEY_PREFIX}*`, COUNT: 100 })) {
-        const raw = await client.get(String(key));
-        if (!raw) continue;
-        const record = JSON.parse(String(raw)) as WorkerRecord;
-        if (record?.workerId) seen.set(record.workerId, record);
+      for await (const keys of client.scanIterator({ MATCH: `${REDIS_KEY_PREFIX}*`, COUNT: 100 })) {
+        for (const key of keys) {
+          const raw = await client.get(String(key));
+          if (!raw) continue;
+          const record = JSON.parse(String(raw)) as WorkerRecord;
+          if (record?.workerId) seen.set(record.workerId, record);
+        }
       }
     } catch {
       /* fall through to memory */
@@ -144,7 +156,12 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
       memoryWorkers.delete(id);
       continue;
     }
-    if (!seen.has(id)) seen.set(id, record);
+    const existing = seen.get(id);
+    // Keep whichever record heartbeated most recently — a stale Redis copy
+    // must not mask a newer in-memory profile (and vice versa).
+    if (!existing || Date.parse(record.lastSeenAt) > Date.parse(existing.lastSeenAt)) {
+      seen.set(id, record);
+    }
   }
   return [...seen.values()].filter((r) => isWorkerAlive(r, nowMs));
 }
@@ -169,10 +186,20 @@ export async function liveWorkerBackends(): Promise<Set<WorkerGpuBackend>> {
   return backends;
 }
 
+/** Live GPU-capable worker counts per backend (cpu excluded). */
+export async function liveWorkerBackendCounts(): Promise<Map<WorkerGpuBackend, number>> {
+  const counts = new Map<WorkerGpuBackend, number>();
+  for (const worker of await listWorkers()) {
+    if (worker.gpuBackend === 'cpu') continue;
+    counts.set(worker.gpuBackend, (counts.get(worker.gpuBackend) ?? 0) + 1);
+  }
+  return counts;
+}
+
 /** Test helper — reset in-memory + redis client state. */
 export async function _resetWorkerRegistryForTests(): Promise<void> {
   memoryWorkers.clear();
-  redisDisabled = false;
+  redisRetryAfterMs = 0;
   if (redisClient?.isOpen) {
     try {
       await redisClient.quit();

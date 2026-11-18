@@ -7,8 +7,8 @@
  */
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import * as Sentry from '@sentry/cloudflare';
 import type { CloudflareOptions } from '@sentry/cloudflare';
+import * as Sentry from '@sentry/cloudflare';
 import {
   canonicalWatchToken,
   compareVideosNewestFirst,
@@ -45,6 +45,13 @@ import {
 import { ensureAdminSettingsTable } from './adminSettingsTable.js';
 import { handleAdminSystemFeatures } from './adminSystemFeatures.js';
 import {
+  handleAdminUploadAbort,
+  handleAdminUploadComplete,
+  handleAdminUploadCreate,
+  handleAdminUploadIngest,
+  handleAdminUploadPartSign,
+} from './adminUploads.js';
+import {
   handleAcknowledgeInsecureNativeScheme,
   handleGetMe,
   handleInsecureNativeSchemeStatus,
@@ -65,6 +72,7 @@ import {
   resolveAuthSubFromRequest,
 } from './auth.js';
 import { B2PrimaryHealthDOBase } from './b2PrimaryHealth.js';
+import { isBillingProxyPath, proxyToBilling } from './billingProxy.js';
 import {
   handleAdminNewsletterCampaigns,
   handleAdminNewsletterDrafts,
@@ -111,7 +119,6 @@ import {
   handleListAccountIrlEvents,
 } from './irlEvents.js';
 import { isPrivateHost } from './is-private-host.js';
-import { isBillingProxyPath, proxyToBilling } from './billingProxy.js';
 import { normalizeLivestreamStatus } from './livestreams.js';
 import { log, runWithDatadogLogContext, setWorkerLogTracingContext } from './logger.js';
 import {
@@ -121,13 +128,8 @@ import {
   resolveMediaEntrypoint,
   sortMasterPlaylistByBandwidth,
 } from './mediaEntrypoints.js';
+import { getRequestPublicOrigin } from './requestPublicOrigin.js';
 import { resolveMetricHttpRoute } from './metricHttpRoutes.js';
-import {
-  buildPublicAssetUrl,
-  handlePublicAsset,
-  rewriteStoredPublicObjectUrl,
-  withRewrittenThumbnailUrl,
-} from './publicAssets.js';
 import {
   handleDevicePairingComplete,
   handleDevicePairingPoll,
@@ -175,6 +177,12 @@ import {
 } from './posthog.js';
 import { recordHttpServerRequestMetric } from './posthogMetrics.js';
 import {
+  buildPublicAssetUrl,
+  handlePublicAsset,
+  rewriteStoredPublicObjectUrl,
+  withRewrittenThumbnailUrl,
+} from './publicAssets.js';
+import {
   createPushCampaignAndDeliveries,
   enqueueOverduePushDeliveries,
   ensurePushTierDefaultSettings,
@@ -205,11 +213,7 @@ import {
   handleReplicationQueue,
 } from './replication.js';
 import { isLocalVideoProxyUrl } from './requestPublicOrigin.js';
-import {
-  isAdministrativeRole,
-  isContentEditorRole,
-  mayAccessNonPublicVideo,
-} from './roles.js';
+import { isAdministrativeRole, isContentEditorRole, mayAccessNonPublicVideo } from './roles.js';
 import { maybeBlockDeploymentFeatureRoute } from './routeFeatureGuard.js';
 import { handleGetAccountRss, handleRotateAccountRss } from './rssAccount.js';
 import {
@@ -548,11 +552,7 @@ const workerHandler = {
               });
             }
 
-            const featureBlock = await maybeBlockDeploymentFeatureRoute(
-              request,
-              env,
-              corsHeaders,
-            );
+            const featureBlock = await maybeBlockDeploymentFeatureRoute(request, env, corsHeaders);
             if (featureBlock) return featureBlock;
 
             // Billing Worker owns payment HTTP (service binding).
@@ -718,6 +718,33 @@ const workerHandler = {
               request.method === 'PATCH'
             ) {
               return handleAdminLivestreamUpdate(request, env, corsHeaders);
+            }
+            if (url.pathname === '/api/admin/videos/uploads' && request.method === 'POST') {
+              return handleAdminUploadCreate(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/part$/) &&
+              request.method === 'GET'
+            ) {
+              return handleAdminUploadPartSign(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/complete$/) &&
+              request.method === 'POST'
+            ) {
+              return handleAdminUploadComplete(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/abort$/) &&
+              request.method === 'POST'
+            ) {
+              return handleAdminUploadAbort(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/ingest$/) &&
+              request.method === 'POST'
+            ) {
+              return handleAdminUploadIngest(request, env, corsHeaders);
             }
             if (url.pathname.startsWith('/api/admin/videos/') && request.method === 'PATCH') {
               return handleAdminVideoUpdate(request, env, ctx, corsHeaders);
@@ -1875,6 +1902,31 @@ async function handleVideoAccess(
       }
     }
 
+    // Progressive raw source (Bunny-style "play the original while encoding"):
+    // when no HLS manifest exists yet but an uploaded source file does, serve it
+    // as a progressive MP4 through the same proxy. Signed with previewUntil=null —
+    // a progressive file can't be time-truncated server-side; the client-side
+    // frame-accurate paywall handles preview gating.
+    let progressiveUrl: string | null = null;
+    const rawSourceKey =
+      typeof video?.raw_source_key === 'string' && video.raw_source_key.trim()
+        ? video.raw_source_key.trim()
+        : null;
+    // mediaFound=false means the entrypoint is a synthetic master.m3u8 that
+    // would 404 — prefer the real uploaded source whenever no media exists.
+    // Token is minted full-access for all viewers: a progressive MP4 can't be
+    // segment-truncated server-side; the client-side paywall gates preview.
+    // status='draft' means the multipart session exists but hasn't committed —
+    // raw_source_key alone is not proof of a playable object.
+    const sourceCommitted = Boolean(rawSourceKey) && video?.status !== 'draft';
+    if (sourceCommitted && (!playlistUrl || !mediaFound) && allowAnonymousPlayable && env.JWT_SECRET) {
+      const vt = await signVideoToken(effectiveUserId, playbackVideoId, env.JWT_SECRET, null);
+      // Absolute URL on the same public origin as playlistUrl — a root-relative
+      // path would resolve against the web origin, not the API.
+      progressiveUrl = `${getRequestPublicOrigin(request, env)}/api/video-proxy/${rawSourceKey}?vt=${encodeURIComponent(vt)}`;
+      if (!mediaFound) playlistUrl = null;
+    }
+
     const playableMoqEndpoint = allowAnonymousPlayable ? livestreamMoqEndpoint : null;
     const playableMoqBroadcast = allowAnonymousPlayable ? livestreamMoqBroadcast : null;
 
@@ -1893,6 +1945,8 @@ async function handleVideoAccess(
         fullDuration,
         previewDuration,
         playlistUrl,
+        progressiveUrl,
+        processing: Boolean(video && video.status && video.status !== 'processed'),
         publishStatus: video?.publish_status ?? null,
         staffPreview: Boolean(video && video.publish_status !== 'published' && canStaffPreview),
         mediaFound,
@@ -1927,7 +1981,9 @@ async function handleVideoAccess(
       is_preview: !hasPremiumAccess,
       subscription_status: subscription?.status ?? 'none',
     });
-    return jsonResponse(response, 200, corsHeaders, anonSetCookie);
+    // Per-user playback URLs — never cacheable by a shared cache.
+    const accessHeaders = { ...corsHeaders, 'Cache-Control': 'private, no-store' };
+    return jsonResponse(response, 200, accessHeaders, anonSetCookie);
   } catch (error) {
     console.error('Error:', error);
     return jsonResponse(
@@ -2058,6 +2114,24 @@ async function handleVideoProxy(
         corsHeaders,
       );
     }
+  }
+
+  // Raw upload sources (videos/{id}/source.{ext}) are the whole original file —
+  // a preview-limited token must never unlock them. Progressive playback tokens
+  // for sources are minted with previewUntil=null by handleVideoAccess (the
+  // client-side paywall gates preview time on progressive MP4).
+  const isRawSource = /^videos\/[^/]+\/source\.(mp4|mov|mkv)$/i.test(normalizedPath);
+  if (
+    isRawSource &&
+    tokenClaims &&
+    typeof tokenClaims.previewUntil === 'number' &&
+    tokenClaims.previewUntil >= 0
+  ) {
+    return jsonResponse(
+      { error: 'Video token does not grant access to the source file', code: 'source_forbidden' },
+      403,
+      corsHeaders,
+    );
   }
 
   // Enforce previewUntil from token claims

@@ -27,6 +27,20 @@ describe('packagerEncoreUrl', () => {
     assert.equal(out, 'http://host.docker.internal:8080/encoreJobs/abc');
   });
 
+  it('clears the original port when the target base has none', () => {
+    const out = rewriteEncoreJobUrlForPackager('http://127.0.0.1:8080/encoreJobs/abc', {
+      PACKAGER_ENCORE_BASE_URL: 'http://encore-web',
+    });
+    assert.equal(out, 'http://encore-web/encoreJobs/abc');
+  });
+
+  it('keeps an explicit destination port', () => {
+    const out = rewriteEncoreJobUrlForPackager('http://127.0.0.1:8080/encoreJobs/abc', {
+      PACKAGER_ENCORE_BASE_URL: 'http://encore-web:9090',
+    });
+    assert.equal(out, 'http://encore-web:9090/encoreJobs/abc');
+  });
+
   it('throws controlled error for malformed PACKAGER_ENCORE_BASE_URL', () => {
     assert.throws(
       () =>

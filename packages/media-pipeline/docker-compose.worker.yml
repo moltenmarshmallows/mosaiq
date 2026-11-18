@@ -23,7 +23,9 @@
 name: vmp-media-worker
 
 x-worker-env: &worker-env
-  ENCORE_SETTINGS_REDIS_URI: ${WORKER_REDIS_URI:-redis://${VMP_COORDINATOR:-redis}:6379}
+  # Redis requires a password (coordinator sets --requirepass) — same
+  # VMP_REDIS_PASSWORD as the coordinator's .env.
+  ENCORE_SETTINGS_REDIS_URI: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@${VMP_COORDINATOR:-redis}:6379}
   ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
   ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work
   ENCORE_SETTINGS_CONCURRENCY: "2"
@@ -34,7 +36,7 @@ x-worker-env: &worker-env
   VMP_WORKER_VERSION: ${VMP_WORKER_VERSION:-docker}
 
 x-worker-common: &worker-common
-  image: ${VMP_WORKER_IMAGE:-ghcr.io/tojemoc/vmp-encore-worker:latest}
+  image: ${VMP_WORKER_IMAGE:-ghcr.io/moltenmarshmallows/vmp-encore-worker:latest}
   build:
     context: .
     dockerfile: worker/Dockerfile
@@ -66,6 +68,7 @@ services:
     environment:
       <<: *worker-env
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,video,utility}
     deploy:
       resources:
         reservations:
@@ -91,16 +94,16 @@ services:
     restart: unless-stopped
     networks: [vmp-media]
     environment:
-      REDIS_URL: ${WORKER_REDIS_URI:-redis://${VMP_COORDINATOR:-redis}:6379}
+      REDIS_URL: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:-}@${VMP_COORDINATOR:-redis}:6379}
       REDIS_QUEUE: ${REDIS_QUEUE:-packaging-queue}
-      CALLBACK_URL: ${PACKAGER_CALLBACK_URL:-http://vmp:${VMP_PACKAGER_SECRET:?Set VMP_PACKAGER_SECRET}@${VMP_COORDINATOR:-vmp-supervisor}:8788/vmp/api}
-      PACKAGE_OUTPUT_FOLDER: ${PACKAGE_OUTPUT_FOLDER:?Set PACKAGE_OUTPUT_FOLDER=s3://bucket/videos}
+      CALLBACK_URL: ${PACKAGER_CALLBACK_URL:-http://vmp:${VMP_PACKAGER_SECRET:-}@${VMP_COORDINATOR:-vmp-supervisor}:8788/vmp/api}
+      PACKAGE_OUTPUT_FOLDER: ${PACKAGE_OUTPUT_FOLDER:-}
       OUTPUT_SUBFOLDER_TEMPLATE: ${OUTPUT_SUBFOLDER_TEMPLATE:-/$$EXTERNALID$$}
       HLS_MANIFEST_NAME_TEMPLATE: ${HLS_MANIFEST_NAME_TEMPLATE:-master.m3u8}
       PACKAGE_FORMAT_OPTIONS_JSON: ${PACKAGE_FORMAT_OPTIONS_JSON:-{"segmentDuration":2}}
-      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-${B2_S3_ENDPOINT:?Set S3_ENDPOINT_URL or B2_S3_ENDPOINT}}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-${B2_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID or B2_ACCESS_KEY_ID}}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-${B2_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY or B2_SECRET_ACCESS_KEY}}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-${B2_S3_ENDPOINT:-}}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-${B2_ACCESS_KEY_ID:-}}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-${B2_SECRET_ACCESS_KEY:-}}
       AWS_REGION: ${AWS_REGION:-${B2_REGION:-auto}}
     volumes:
       - ${ENCORE_MEDIA_MOUNT:-/mnt}:/media

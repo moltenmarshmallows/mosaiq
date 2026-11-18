@@ -45,3 +45,4 @@ Thumbs.db
 .nx/polygraph
 .claude/worktrees
 .claude/settings.local.json
+packages/media-pipeline/observability/dashboard-token.txt

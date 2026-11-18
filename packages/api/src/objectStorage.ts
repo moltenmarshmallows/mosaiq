@@ -40,8 +40,8 @@ export function storageGetResultToResponse(result: GetObjectResult): Response {
   if (result.contentType) headers.set('Content-Type', result.contentType);
   const isPartial = Boolean(result.range);
   if (isPartial && result.range) {
-    const { offset, length } = result.range;
-    const total = result.size ?? offset + length;
+    const { offset, length, total: rangeTotal } = result.range;
+    const total = rangeTotal ?? result.size ?? offset + length;
     headers.set('Content-Range', `bytes ${offset}-${offset + length - 1}/${total}`);
     headers.set('Content-Length', String(length));
   } else if (result.size != null) {

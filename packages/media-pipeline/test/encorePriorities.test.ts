@@ -1,10 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import {
-  ENCORE_JOB_PRIORITY,
-  encorePriorityFor,
-  encoreQueueForPriority,
-} from '../encorePriorities.js';
+import { encorePriorityFor, encoreQueueForPriority } from '../encorePriorities.js';
 
 describe('encorePriorities', () => {
   it('maps GPU-class jobs to queue 0 and CPU-class to queue 1', () => {
@@ -18,15 +14,15 @@ describe('encorePriorities', () => {
 
   it('keeps GPU fast-lane ahead of GPU ladders and CPU fast-lane ahead of CPU ladders', () => {
     assert.ok(
-      ENCORE_JOB_PRIORITY.FAST_LANE_720P_GPU > ENCORE_JOB_PRIORITY.FULL_LADDER_GPU,
+      encorePriorityFor('fast_lane', 'gpu') > encorePriorityFor('full_ladder', 'gpu'),
       'fast lane should outrank ladder within GPU class',
     );
     assert.ok(
-      ENCORE_JOB_PRIORITY.FAST_LANE_720P_CPU > ENCORE_JOB_PRIORITY.FULL_LADDER_CPU,
+      encorePriorityFor('fast_lane', 'cpu') > encorePriorityFor('full_ladder', 'cpu'),
       'fast lane should outrank ladder within CPU class',
     );
     assert.ok(
-      ENCORE_JOB_PRIORITY.FULL_LADDER_CPU > ENCORE_JOB_PRIORITY.PREVIEW_MP3,
+      encorePriorityFor('full_ladder', 'cpu') > encorePriorityFor('preview_mp3', 'cpu'),
       'ladder should outrank podcast work',
     );
   });

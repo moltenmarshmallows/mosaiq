@@ -32,6 +32,11 @@ describe('buildAggregateEncoreJobDoc', () => {
     assert.equal(doc.status, 'SUCCESSFUL');
     assert.equal((doc.output as unknown[]).length, 3);
     assert.equal((doc.inputs as { uri: string }[])[0].uri, '/media/src/v1.mp4');
+    // The stock packager packages every output — assert they are the member
+    // renditions, not just a count.
+    const files = (doc.output as { file: string }[]).map((o) => o.file);
+    assert.deepEqual(files, ['j1/video.mp4', 'j2/video.mp4', 'j3/video.mp4']);
+    assert.ok((doc.output as { type: string }[]).every((o) => o.type === 'Video'));
   });
 
   it('fails when a member is unfinished rather than producing a partial ladder', () => {
@@ -64,6 +69,9 @@ describe('buildAggregateEncoreJobDoc', () => {
 
 describe('aggregateJobIdFor', () => {
   it('prefixes the video id', () => {
-    assert.equal(aggregateJobIdFor('abc'), 'agg-abc');
+    assert.match(aggregateJobIdFor('abc'), /^agg-abc-[0-9a-f]{8}$/);
+    // Each attempt must get a distinct id so a retry can't collide with a
+    // still-running prior packaging attempt.
+    assert.notEqual(aggregateJobIdFor('abc'), aggregateJobIdFor('abc'));
   });
 });

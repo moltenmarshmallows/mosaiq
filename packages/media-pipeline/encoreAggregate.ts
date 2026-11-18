@@ -8,6 +8,7 @@
  * that the stock packager treats exactly like a real Encore job.
  */
 
+import crypto from 'node:crypto';
 import type { EncoreJob, EncoreJobOutput } from './encoreClient.js';
 
 export const AGGREGATE_JOB_PATH_PREFIX = '/vmp/api/encoreJobAggregate/';
@@ -23,7 +24,10 @@ export type AggregateJobRecord = {
 };
 
 export function aggregateJobIdFor(videoId: string): string {
-  return `agg-${videoId}`;
+  // Per-attempt suffix: a retried pipeline registers + enqueues a fresh
+  // packaging job instead of colliding with a still-running prior attempt.
+  // videoId remains the output identity.
+  return `agg-${videoId}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 /**

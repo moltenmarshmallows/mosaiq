@@ -1344,8 +1344,9 @@
   });
 
   const formatDuration = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const total = Math.floor(seconds);
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
@@ -2374,6 +2375,12 @@
         return;
       }
       const playlistUrl = videoData.value?.video?.playlistUrl;
+      // Raw upload still encoding → progressive MP4 through the same proxy.
+      const mediaUrl =
+        playlistUrl ||
+        (typeof videoData.value?.video?.progressiveUrl === 'string'
+          ? videoData.value.video.progressiveUrl
+          : null);
       // Warm cheapest rung + first segments while Video.js boots (and share Worker cache).
       if (playlistUrl && !rateLimited.value) {
         void import('~/utils/hlsStartupPrefetch')
@@ -2394,9 +2401,9 @@
           : Promise.resolve({ ok: true as const });
 
       let usedOfflineSource = playingOffline.value;
-      if (playlistUrl && !rateLimited.value) {
+      if (mediaUrl && !rateLimited.value) {
         error.value = null;
-        let resolvedPlaylist = playlistUrl;
+        let resolvedPlaylist = mediaUrl;
         if (videoData.value?.hasAccess && !usedOfflineSource) {
           try {
             const offline = await getOfflineSource(
@@ -2626,6 +2633,13 @@
     handleLoadedMetadata = () => {
       if (!isCurrentInvocation()) return;
       applyPendingResume();
+      // Progressive MP4 path: D1 often has full_duration=0 while the raw file
+      // is encoding — take the element's real duration so seek/preview-lock UI works.
+      const el = (nativeVideoWithListeners ?? getNativeVideoElement(video)) as HTMLMediaElement | null;
+      const mediaDuration = el?.duration ?? 0;
+      if (!resolvedFullDuration.value && mediaDuration > 0) {
+        resolvedFullDuration.value = mediaDuration;
+      }
       if (import.meta.env.DEV) {
         console.log('Video metadata loaded');
       }

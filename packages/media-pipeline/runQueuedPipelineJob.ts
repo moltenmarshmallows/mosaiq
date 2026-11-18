@@ -213,7 +213,7 @@ async function runPodcastSidecars(ctx: QueuedPipelineContext): Promise<void> {
   const podcastOut = path.join(ctx.tmpDir, 'encore', 'podcast');
   await mkdir(podcastOut, { recursive: true });
   const podcastJobId = await submitEncoreJob({
-    profile: (await resolveEncoreProfile('vmp-podcast-mp3')).profile,
+    profile: 'vmp-podcast-mp3', // fixed CPU-only — no worker-registry lookup
     inputPath: ctx.inputPath,
     outputFolder: podcastOut,
     baseName: `vmp-${ctx.videoId}-podcast`,
@@ -237,7 +237,7 @@ async function runPodcastSidecars(ctx: QueuedPipelineContext): Promise<void> {
   const previewOut = path.join(ctx.tmpDir, 'encore', 'preview');
   await mkdir(previewOut, { recursive: true });
   const previewJobId = await submitEncoreJob({
-    profile: (await resolveEncoreProfile('vmp-podcast-preview')).profile,
+    profile: 'vmp-podcast-preview', // fixed CPU-only — no worker-registry lookup
     inputPath: ctx.inputPath,
     outputFolder: previewOut,
     baseName: `vmp-${ctx.videoId}-preview`,
