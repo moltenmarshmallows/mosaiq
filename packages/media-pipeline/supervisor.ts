@@ -26,7 +26,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildAggregateEncoreJobDoc } from './encoreAggregate.js';
 import { getEncoreJob } from './encoreClient.js';
-import { resolveInboxDir } from './inboxDirs.js';
 import { gauge, increment } from './metrics.js';
 import { rewriteEncoreJobUrlForPackager } from './packagerEncoreUrl.js';
 import { enqueuePackagerJob } from './packagingQueue.js';
