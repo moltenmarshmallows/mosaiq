@@ -1,0 +1,331 @@
+/**
+ * Browser-direct S3 multipart upload of a raw video to B2.
+ *
+ * Flow: POST /api/admin/videos/uploads → per-part presigned PUTs → complete.
+ * The API then tells the media pipeline to pull the file via the video proxy
+ * (no direct B2 egress), and the raw file is playable while HLS encodes.
+ *
+ * Resume: the session (uploadId + finished parts) is kept in localStorage
+ * keyed by file name/size, so a failed upload can continue where it stopped.
+ */
+
+import type { Ref } from 'vue';
+
+export type AdminUploadProgress = {
+  state: 'idle' | 'creating' | 'uploading' | 'completing' | 'done' | 'error';
+  bytesSent: number;
+  totalBytes: number;
+  videoId: string | null;
+  error: string | null;
+};
+
+type Part = { partNumber: number; etag: string };
+
+type Session = {
+  videoId: string;
+  uploadId: string;
+  partSize: number;
+  fileName: string;
+  fileSize: number;
+  fingerprint: string;
+  parts: Part[];
+};
+
+const LS_PREFIX = 'vmp-upload:';
+const CONCURRENCY = 3;
+const MAX_PART_RETRIES = 4;
+
+export function useAdminVideoUpload(
+  apiUrl: string,
+  authHeader: () => Record<string, string>,
+  progress: Ref<AdminUploadProgress>,
+) {
+  const sessionKey = (file: File) =>
+    `${LS_PREFIX}${apiUrl}:${file.name}:${file.size}:${file.lastModified}`;
+
+  /** Full-file content check: hash-of-hashes over 8MB chunks so a same-named
+   *  different file can never resume into the wrong session. Cached per File —
+   *  loadSession + resume hash the same pick repeatedly otherwise. */
+  const fingerprintCache = new WeakMap<File, Promise<string>>();
+  const fingerprint = (file: File): Promise<string> => {
+    const cached = fingerprintCache.get(file);
+    if (cached) return cached;
+    const pending = computeFingerprint(file);
+    fingerprintCache.set(file, pending);
+    return pending;
+  };
+  const computeFingerprint = async (file: File): Promise<string> => {
+    try {
+      const chunkSize = 8 * 1024 * 1024;
+      const hashes: Uint8Array[] = [];
+      for (let off = 0; off < Math.max(1, file.size); off += chunkSize) {
+        const h = await crypto.subtle.digest(
+          'SHA-256',
+          await file.slice(off, off + chunkSize).arrayBuffer(),
+        );
+        hashes.push(new Uint8Array(h));
+      }
+      const sizeBytes = new TextEncoder().encode(String(file.size));
+      const buf = new Uint8Array(hashes.length * 32 + sizeBytes.byteLength);
+      for (const [i, h] of hashes.entries()) buf.set(h, i * 32);
+      buf.set(sizeBytes, hashes.length * 32);
+      const digest = await crypto.subtle.digest('SHA-256', buf);
+      return Array.from(new Uint8Array(digest).subarray(0, 8), (b) =>
+        b.toString(16).padStart(2, '0'),
+      ).join('');
+    } catch {
+      return `${file.name}:${file.size}:${file.lastModified}`;
+    }
+  };
+
+  const loadSession = async (file: File): Promise<Session | null> => {
+    try {
+      const raw = localStorage.getItem(sessionKey(file));
+      const s = raw ? (JSON.parse(raw) as Session) : null;
+      if (!s || s.fileName !== file.name || s.fileSize !== file.size) return null;
+      return s.fingerprint === (await fingerprint(file)) ? s : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const saveSession = (file: File, s: Session) => {
+    try {
+      localStorage.setItem(sessionKey(file), JSON.stringify(s));
+    } catch {
+      /* quota-full: resume just won't survive a reload */
+    }
+  };
+  const clearSession = (file: File) => {
+    try {
+      localStorage.removeItem(sessionKey(file));
+    } catch {
+      /* quota/security errors must never mask an upload result */
+    }
+  };
+
+  const apiFetch = async (path: string, init: RequestInit = {}) => {
+    const res = await fetch(`${apiUrl}${path}`, {
+      ...init,
+      headers: { ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...authHeader() },
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as {
+        error?: string;
+        code?: string;
+      } | null;
+      const err = new Error(body?.error || `Upload API error ${res.status}`) as Error & {
+        status?: number;
+        code?: string;
+      };
+      err.status = res.status;
+      err.code = body?.code;
+      throw err;
+    }
+    return res.json();
+  };
+
+  /** PUT one part to the presigned URL; resolves with the part's ETag. */
+  const putPart = (url: string, blob: Blob, onProgress: (loaded: number) => void) =>
+    new Promise<string>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', url);
+      xhr.timeout = 10 * 60 * 1000; // a stalled part retries instead of hanging forever
+      xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded);
+      xhr.ontimeout = () => reject(new Error('Part upload timed out'));
+      xhr.onload = () => {
+        const etag = xhr.getResponseHeader('ETag');
+        if (xhr.status >= 200 && xhr.status < 300 && etag) resolve(etag.replace(/"/g, ''));
+        else {
+          const err = new Error(`Part upload failed: HTTP ${xhr.status}`) as Error & {
+            status?: number;
+          };
+          err.status = xhr.status;
+          reject(err);
+        }
+      };
+      xhr.onerror = () => reject(new Error('Part upload failed: network error'));
+      xhr.send(blob);
+    });
+
+  const upload = async (
+    file: File,
+    opts: { title?: string; pipelineMode?: 'fast_lane' | 'full_ladder' } = {},
+  ) => {
+    progress.value = {
+      state: 'creating',
+      bytesSent: 0,
+      totalBytes: file.size,
+      videoId: null,
+      error: null,
+    };
+    try {
+      let session = await loadSession(file);
+      if (!session) {
+        const created = await apiFetch('/api/admin/videos/uploads', {
+          method: 'POST',
+          body: JSON.stringify({
+            filename: file.name,
+            title: opts.title,
+            pipelineMode: opts.pipelineMode ?? 'fast_lane',
+          }),
+        });
+        session = {
+          videoId: created.videoId,
+          uploadId: created.uploadId,
+          partSize: created.partSize,
+          fileName: file.name,
+          fileSize: file.size,
+          fingerprint: await fingerprint(file),
+          parts: [],
+        };
+        saveSession(file, session);
+      }
+      const s = session;
+      // Server killed the session (404/expire): flag it so in-flight part
+      // successes from other pool workers don't resurrect localStorage.
+      let sessionInvalid = false;
+      progress.value = { ...progress.value, state: 'uploading', videoId: s.videoId };
+
+      const partCount = Math.max(1, Math.ceil(file.size / s.partSize));
+      const done = new Set(s.parts.map((p) => p.partNumber));
+      const inFlight = new Map<number, number>();
+      const sent = () =>
+        s.parts.reduce(
+          (n, p) => n + Math.min(s.partSize, file.size - (p.partNumber - 1) * s.partSize),
+          0,
+        ) + [...inFlight.values()].reduce((a, b) => a + b, 0);
+
+      const uploadPart = async (partNumber: number) => {
+        if (sessionInvalid) throw new Error('upload session invalidated');
+        const blob = file.slice((partNumber - 1) * s.partSize, partNumber * s.partSize);
+        for (let attempt = 0; ; attempt++) {
+          inFlight.set(partNumber, 0);
+          try {
+            const { url } = await apiFetch(
+              `/api/admin/videos/uploads/${s.videoId}/part?uploadId=${encodeURIComponent(s.uploadId)}&partNumber=${partNumber}`,
+            );
+            const etag = await putPart(url, blob, (loaded) => {
+              inFlight.set(partNumber, loaded);
+              progress.value = { ...progress.value, bytesSent: sent() };
+            });
+            inFlight.delete(partNumber);
+            if (!sessionInvalid) {
+              s.parts.push({ partNumber, etag });
+              s.parts.sort((a, b) => a.partNumber - b.partNumber);
+              saveSession(file, s);
+            }
+            progress.value = { ...progress.value, bytesSent: sent() };
+            return;
+          } catch (err) {
+            inFlight.delete(partNumber);
+            // Server-side session gone (aborted/expire) — drop local state so
+            // the next upload() starts a fresh session instead of retrying 404s.
+            const e = err as Error & { status?: number; code?: string };
+            if (e.status === 404 || e.code === 'not_found') {
+              sessionInvalid = true;
+              clearSession(file);
+              throw err;
+            }
+            // Other 4xx are definitive rejections (bad part, auth) — retrying
+            // burns attempts for nothing; 5xx/network stays retryable.
+            if (e.status !== undefined && e.status >= 400 && e.status < 500) throw err;
+            if (attempt >= MAX_PART_RETRIES) throw err;
+            await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+          }
+        }
+      };
+
+      // Simple worker-pool over part numbers. A rejection stops idle workers
+      // from claiming new parts; every already-started PUT is awaited before
+      // the error propagates, so completed siblings are saved for retry and no
+      // worker can write the session after upload() rejects.
+      let poolFailed = false;
+      let firstError: unknown = null;
+      const pending: number[] = [];
+      for (let n = 1; n <= partCount; n++) if (!done.has(n)) pending.push(n);
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, pending.length) }, async () => {
+          for (let n = pending.pop(); n !== undefined && !poolFailed; n = pending.pop()) {
+            try {
+              await uploadPart(n);
+            } catch (err) {
+              poolFailed = true;
+              firstError ??= err;
+            }
+          }
+        }),
+      );
+      if (firstError !== null) throw firstError;
+
+      progress.value = { ...progress.value, state: 'completing' };
+      let completed;
+      try {
+        completed = await apiFetch(`/api/admin/videos/uploads/${s.videoId}/complete`, {
+          method: 'POST',
+          body: JSON.stringify({
+            uploadId: s.uploadId,
+            // Omit mode when unset — the server keeps the one stored at
+            // creation; hardcoding a default would downgrade a resumed session.
+            ...(opts.pipelineMode ? { pipelineMode: opts.pipelineMode } : {}),
+            parts: s.parts,
+          }),
+        });
+      } catch (err) {
+        // A definitive "session gone" lets the next file pick restart cleanly;
+        // transient/uncertain outcomes keep the saved parts for resume.
+        const e = err as Error & { status?: number; code?: string };
+        if (e.status === 404 || e.code === 'not_found') clearSession(file);
+        // Upload committed, only the encoder notification failed — that is a
+        // done-state with a retryable ingest, not an upload error.
+        if (e.status === 502 && typeof e.code === 'string' && e.code.startsWith('ingest_')) {
+          clearSession(file);
+          progress.value = { ...progress.value, state: 'done', bytesSent: file.size };
+          return { videoId: s.videoId, ingestDelivered: false };
+        }
+        throw err;
+      }
+      clearSession(file);
+      progress.value = { ...progress.value, state: 'done', bytesSent: file.size };
+      return { videoId: s.videoId, ingestDelivered: completed?.ingest?.delivered !== false };
+    } catch (err) {
+      progress.value = {
+        ...progress.value,
+        state: 'error',
+        error: err instanceof Error ? err.message : String(err),
+      };
+      throw err;
+    }
+  };
+
+  const resume = async (file: File) => (await loadSession(file)) !== null;
+
+  /** Re-notify the encoder for an upload whose ingest webhook failed. */
+  const retryIngest = async (videoId: string) => {
+    await apiFetch(`/api/admin/videos/uploads/${videoId}/ingest`, { method: 'POST' });
+  };
+
+  const abort = async (file: File) => {
+    const s = await loadSession(file);
+    if (!s) return;
+    try {
+      await apiFetch(`/api/admin/videos/uploads/${s.videoId}/abort`, {
+        method: 'POST',
+        body: JSON.stringify({ uploadId: s.uploadId }),
+      });
+    } catch (err) {
+      // Confirmed gone server-side → drop the local session; any other failure
+      // keeps it so a later abort or resume can still reach the same upload.
+      const e = err as Error & { status?: number; code?: string };
+      if (e.status === 404 || e.code === 'not_found') {
+        clearSession(file);
+        return;
+      }
+      throw err;
+    }
+    clearSession(file);
+    progress.value = { state: 'idle', bytesSent: 0, totalBytes: 0, videoId: null, error: null };
+  };
+
+  return { upload, resume, abort, retryIngest };
+}

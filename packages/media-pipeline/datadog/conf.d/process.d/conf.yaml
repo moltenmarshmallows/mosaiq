@@ -6,21 +6,21 @@ init_config:
 
 instances:
   - name: vmp-supervisor
-    search_string: ['node', '/packages/media-pipeline/dist/supervisor.js']
+    search_string: ["node", "/packages/media-pipeline/dist/supervisor.js"]
     exact_match: false
     tags:
       - service:vmp-transcoder
       - component:supervisor
 
   - name: vmp-pipeline-watch
-    search_string: ['node', '/packages/media-pipeline/dist/pipeline_watch.js']
+    search_string: ["node", "/packages/media-pipeline/dist/pipeline_watch.js"]
     exact_match: false
     tags:
       - service:vmp-transcoder
       - component:pipeline
 
   - name: vmp-ffmpeg
-    search_string: ['ffmpeg']
+    search_string: ["ffmpeg"]
     exact_match: false
     tags:
       - service:vmp-transcoder

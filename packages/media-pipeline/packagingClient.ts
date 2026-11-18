@@ -69,7 +69,17 @@ export type PackagingRegistration = {
   videoId: string;
   stage: PackagingStage;
   pipelineMode: PipelineMode;
+  /**
+   * Rendition-split mode: encoreJobUrl points at the supervisor's aggregate
+   * endpoint, which merges the member jobs' outputs for the packager.
+   */
+  aggregate?: { inputUri: string; memberJobIds: string[] };
 };
+
+/** URL the packager should use to reach this supervisor (docker DNS by default). */
+export function supervisorBaseUrl(): string {
+  return SUPERVISOR_BASE;
+}
 
 export type PackagingStatus = {
   status: 'pending' | 'success' | 'failed';

@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # Supervisor: pipeline jobs, queue depth, worker registry, TTP, process stats.
+  # /metrics requires VMP_SUPERVISOR_DASHBOARD_SECRET — scrape needs the same
+  # secret mounted at /etc/prometheus/secrets/dashboard_token (host file set via
+  # PROMETHEUS_DASHBOARD_TOKEN_FILE in .env).
+  - job_name: vmp-supervisor
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/dashboard_token
+    static_configs:
+      - targets: ["vmp-supervisor:8788"]
+
+  # Redis: queue lengths, memory, client counts.
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]

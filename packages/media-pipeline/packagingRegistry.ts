@@ -4,6 +4,7 @@
  */
 
 import { createClient } from 'redis';
+import type { AggregateJobRecord } from './encoreAggregate.js';
 import type { PackagingStage, PipelineMode } from './pipelineMode.js';
 
 export type PackagingJobRecord = {
@@ -16,6 +17,17 @@ export type PackagingJobRecord = {
   outputPath?: string;
   error?: string;
   updatedAt: string;
+  /**
+   * Set for rendition-split packaging: the packager fetches this job's URL on
+   * the supervisor and receives a merged Encore job built from memberJobIds.
+   */
+  aggregate?: Pick<AggregateJobRecord, 'inputUri' | 'memberJobIds'>;
+  /**
+   * One-shot Basic-auth password embedded in the packager's copy of
+   * encoreJobUrl for aggregate fetches — keeps the master VMP_PACKAGER_SECRET
+   * out of Redis and bounds a leak to this single job.
+   */
+  aggregateToken?: string;
 };
 
 /** Match supervisor MAX_PIPELINE_SUCCESS_JOBS retention. */

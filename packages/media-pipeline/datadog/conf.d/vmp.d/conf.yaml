@@ -11,7 +11,7 @@ logs:
     log_processing_rules:
       - type: exclude_at_match
         name: exclude_datadog_agent_noise
-        pattern: 'datadog-agent'
+        pattern: "datadog-agent"
 
   # Optional: dedicated TTP JSONL when VMP_TTP_LOG_PATH is set (uncomment path).
   # - type: file

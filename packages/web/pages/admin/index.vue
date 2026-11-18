@@ -314,13 +314,82 @@
         >
           <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
             <h2 class="text-xl font-bold text-gray-900 dark:text-white">Video management</h2>
-            <button
-              class="inline-flex items-center gap-2 px-3 py-2 rounded bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold"
-              @click="openLivestreamModal"
+            <div class="flex items-center gap-2">
+              <input
+                ref="videoUploadInput"
+                type="file"
+                accept="video/mp4,video/quicktime,.mp4,.mov,.mkv"
+                class="hidden"
+                @change="handleVideoUploadPick"
+              />
+              <button
+                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-blue-600 hover:bg-blue-700 dark:bg-blue-600 dark:hover:bg-blue-700 text-white dark:text-white text-sm font-semibold disabled:opacity-50"
+                :disabled="videoUploadProgress.state === 'creating' || videoUploadProgress.state === 'uploading' || videoUploadProgress.state === 'completing'"
+                @click="videoUploadInput?.click()"
+              >
+                <span class="text-base leading-none">+</span>
+                Upload video
+              </button>
+              <button
+                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-purple-600 hover:bg-purple-700 dark:bg-purple-600 dark:hover:bg-purple-700 text-white dark:text-white text-sm font-semibold"
+                @click="openLivestreamModal"
+              >
+                <span class="text-base leading-none">+</span>
+                Create new livestream
+              </button>
+            </div>
+          </div>
+          <div
+            v-if="videoUploadProgress.state !== 'idle'"
+            class="mb-4 rounded-lg border p-3 text-sm"
+            :class="
+              videoUploadProgress.state === 'error'
+                ? 'border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300'
+                : videoUploadProgress.state === 'done'
+                  ? 'border-green-300 bg-green-50 text-green-800 dark:border-green-800 dark:bg-green-950/40 dark:text-green-300'
+                  : 'border-blue-300 bg-blue-50 text-blue-800 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-300'
+            "
+          >
+            <div class="flex items-center justify-between gap-3">
+              <span class="truncate">
+                {{ videoUploadFileName }} —
+                <template v-if="videoUploadProgress.state === 'creating'">starting upload…</template>
+                <template v-else-if="videoUploadProgress.state === 'uploading'">
+                  uploading {{ uploadPercent }}%
+                </template>
+                <template v-else-if="videoUploadProgress.state === 'completing'">
+                  finishing + queued for encoding…
+                </template>
+                <template v-else-if="videoUploadProgress.state === 'done'">
+                  uploaded — playable immediately, encoding in background
+                </template>
+                <template v-else>{{ videoUploadProgress.error }}</template>
+              </span>
+              <button
+                v-if="videoUploadProgress.state === 'error'"
+                class="shrink-0 underline text-gray-700 dark:text-gray-200"
+                @click="dismissVideoUpload"
+              >
+                dismiss
+              </button>
+              <button
+                v-if="videoUploadProgress.state === 'done' && videoUploadProgress.videoId && pendingIngestVideoIds.has(videoUploadProgress.videoId)"
+                class="shrink-0 underline text-green-800 dark:text-green-300"
+                :disabled="videoUploadIngestRetrying === videoUploadProgress.videoId"
+                @click="retryVideoIngest(videoUploadProgress.videoId)"
+              >
+                {{ videoUploadIngestRetrying === videoUploadProgress.videoId ? 'retrying…' : 'retry encoder notification' }}
+              </button>
+            </div>
+            <div
+              v-if="videoUploadProgress.state === 'uploading'"
+              class="mt-2 h-1.5 w-full rounded bg-blue-200 dark:bg-blue-900"
             >
-              <span class="text-base leading-none">+</span>
-              Create new livestream
-            </button>
+              <div
+                class="h-1.5 rounded bg-blue-600 transition-all"
+                :style="{ width: `${uploadPercent}%` }"
+              />
+            </div>
           </div>
           <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
             Set preview lock per video: 0s means premium-only access, while matching full duration
@@ -511,6 +580,15 @@
                       <p class="text-xs text-gray-400 dark:text-gray-500 truncate">
                         {{ video.id }}
                       </p>
+                      <button
+                        v-if="pendingIngestVideoIds.has(video.id)"
+                        class="mt-0.5 text-xs underline text-amber-700 dark:text-amber-300 disabled:opacity-50"
+                        :disabled="videoUploadIngestRetrying === video.id"
+                        title="The encoder was never notified about this upload"
+                        @click="retryVideoIngest(video.id)"
+                      >
+                        {{ videoUploadIngestRetrying === video.id ? 'retrying…' : 'encoder not notified — retry' }}
+                      </button>
                       <!-- Vanity slug editor -->
                       <div class="mt-0.5 group/slug flex items-center gap-1 min-w-0">
                         <div
@@ -4046,6 +4124,7 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     layoutIncludesFeaturedRowBlock,
   } from '~/composables/useHomepageLayout';
   import { adminTableThumbUrl, sizeUrl } from '~/composables/useThumbnail';
+  import { useAdminVideoUpload, type AdminUploadProgress } from '~/composables/useAdminVideoUpload';
   import { renderMarkdownToHtml } from '~/utils/markdown';
 
   // ── Route guard ───────────────────────────────────────────────────────────────
@@ -4253,6 +4332,68 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
   const trashing = ref<Record<string, boolean>>({});
   const uploadingFor = ref<string | null>(null);
   const thumbInputFocused = ref<string | null>(null);
+
+  // Raw file upload → B2 multipart → pipeline ingest (composable handles resume).
+  const videoUploadInput = ref<HTMLInputElement | null>(null);
+  const videoUploadProgress = ref<AdminUploadProgress>({
+    state: 'idle',
+    bytesSent: 0,
+    totalBytes: 0,
+    videoId: null,
+    error: null,
+  });
+  const videoUploadFileName = ref('');
+  // Video IDs whose ingest webhook failed — one localStorage key per video so
+  // concurrent admin tabs can never clobber each other's pending set (a shared
+  // array still races between one tab's read and its write).
+  const INGEST_PENDING_PREFIX = 'vmp-ingest-pending:';
+  const loadPendingIngest = (): Set<string> => {
+    const ids = new Set<string>();
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k?.startsWith(INGEST_PENDING_PREFIX)) {
+          ids.add(k.slice(INGEST_PENDING_PREFIX.length));
+        }
+      }
+      // Migrate the retired shared-array key, then drop it.
+      const legacy = JSON.parse(localStorage.getItem('vmp-ingest-pending') || '[]');
+      for (const id of legacy as string[]) {
+        ids.add(id);
+        localStorage.setItem(`${INGEST_PENDING_PREFIX}${id}`, '1');
+      }
+      localStorage.removeItem('vmp-ingest-pending');
+    } catch { /* best-effort */ }
+    return ids;
+  };
+  const pendingIngestVideoIds = ref<Set<string>>(loadPendingIngest());
+  const videoUploadIngestRetrying = ref<string | null>(null);
+  const writePendingIngest = (id: string, pending: boolean) => {
+    try {
+      if (pending) localStorage.setItem(`${INGEST_PENDING_PREFIX}${id}`, '1');
+      else localStorage.removeItem(`${INGEST_PENDING_PREFIX}${id}`);
+    } catch { /* best-effort */ }
+  };
+  const markIngestPending = (id: string) => {
+    pendingIngestVideoIds.value = new Set([...pendingIngestVideoIds.value, id]);
+    writePendingIngest(id, true);
+  };
+  const clearIngestPending = (id: string) => {
+    const next = new Set(pendingIngestVideoIds.value);
+    next.delete(id);
+    pendingIngestVideoIds.value = next;
+    writePendingIngest(id, false);
+  };
+  const uploadPercent = computed(() =>
+    videoUploadProgress.value.totalBytes > 0
+      ? Math.min(
+          100,
+          Math.round(
+            (videoUploadProgress.value.bytesSent / videoUploadProgress.value.totalBytes) * 100,
+          ),
+        )
+      : 0,
+  );
   const activeAdminTab = ref<
     | 'videos'
     | 'categories'
@@ -5696,6 +5837,67 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     } finally {
       livestreamModal.value.saving = false;
     }
+  };
+
+  const videoUpload = useAdminVideoUpload(config.public.apiUrl, authHeader, videoUploadProgress);
+
+  const handleVideoUploadPick = async (event: Event) => {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    videoUploadFileName.value = file.name;
+    try {
+      const resumed = await videoUpload.resume(file);
+      const result = await videoUpload.upload(file, { pipelineMode: 'fast_lane' });
+      if (result?.ingestDelivered === false && result.videoId) {
+        markIngestPending(result.videoId);
+      }
+      showToast(
+        result?.ingestDelivered ? 'success' : 'error',
+        !result?.ingestDelivered
+          ? 'Upload finished, but the encoder could not be reached — the raw file is playable; retry encoding from the pipeline dashboard.'
+          : resumed
+            ? 'Upload resumed and finished — video is playable while it encodes.'
+            : 'Upload finished — video is playable while it encodes.',
+      );
+      await loadVideos();
+    } catch {
+      // Error text is already shown in the progress banner.
+    }
+  };
+
+  const retryVideoIngest = async (videoId: string) => {
+    videoUploadIngestRetrying.value = videoId;
+    try {
+      await videoUpload.retryIngest(videoId);
+      clearIngestPending(videoId);
+      showToast('success', 'Encoder notified — the video is queued for encoding.');
+    } catch (err) {
+      const e = err as Error & { status?: number; code?: string };
+      if (e.code === 'already_processed') {
+        clearIngestPending(videoId);
+        showToast('success', 'Video already processed — nothing left to notify.');
+      } else if (e.code === 'not_committed') {
+        showToast('error', 'Upload has not finished committing yet — retry shortly.');
+      } else if (e.code === 'ingest_not_configured' || e.code === 'ingest_url_invalid') {
+        showToast('error', 'Ingest webhook is not configured on the API — check pipeline settings.');
+      } else {
+        showToast('error', 'Encoder still unreachable — try again later.');
+      }
+    } finally {
+      videoUploadIngestRetrying.value = null;
+    }
+  };
+
+  const dismissVideoUpload = () => {
+    videoUploadProgress.value = {
+      state: 'idle',
+      bytesSent: 0,
+      totalBytes: 0,
+      videoId: null,
+      error: null,
+    };
   };
 
   const loadVideos = async () => {

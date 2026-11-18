@@ -215,8 +215,20 @@ Pooled app for **Host → `tenant_id`**, custom domains (CF for SaaS), eventual 
 Make inbox → Encore → encore-packager → private object storage → API callback reliable on one node, then scale with the same contracts.
 
 - [ ] Fail-fast Compose (`${VAR:?}`), pipeline doctor, Redis packaging registry, packager Encore URL rewrite, storage env aliases
-- [ ] Horizontal scale via Compose `--scale` (not Swarm `deploy.replicas`) — `encore:up:scale`
+- [x] Horizontal scale via Compose `--scale` (not Swarm `deploy.replicas`) — superseded by `media-pipeline-distributed`
 - [ ] Maintainer single-node smoke: drop file in inbox → `master.m3u8` + `pipeline-status` callback
+
+### Distributed media pipeline (`media-pipeline-distributed`)
+
+Coordinator/worker rework of `@vmp/media-pipeline` — two Compose files replace the 9-file overlay model.
+
+- [x] `docker-compose.coordinator.yml` (Redis, Encore API, packager, tusd, supervisor) + `docker-compose.worker.yml` (auto GPU probe → heartbeat → queue routing)
+- [x] Capability classes on Encore queues: GPU jobs → queue 0 (GPU workers only), CPU jobs → queue 1; profiles follow **live worker registry**, not coordinator hardware
+- [x] `VMP_LADDER_SPLIT=job|renditions` — per-resolution parallelism with packager-compatible aggregate job docs
+- [x] TUS resumable uploads via `tusd` + supervisor `/vmp/uploads` proxy + post-finish → inbox hook
+- [x] Prometheus `/metrics` + optional Grafana/Prometheus `observability` compose profile + worker table in dashboard
+- [ ] Maintainer smoke: coordinator + worker on one host → `master.m3u8` + callback; then a second worker node
+- [ ] Custom GPU worker image (`vmp-encore-worker`) published by CI; verify NVENC/VAAPI probe paths on real hardware
 
 ### Video startup latency (`video-startup-latency`)
 

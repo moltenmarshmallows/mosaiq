@@ -1,5 +1,8 @@
 import { Readable } from 'node:stream';
 import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
   DeleteObjectCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
@@ -7,6 +10,7 @@ import {
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
+  UploadPartCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { HttpHandler } from '@smithy/core/protocols';
@@ -145,13 +149,13 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
       const stream = bodyToWebStream(out.Body);
       if (!stream) return null;
       const contentRange = out.ContentRange;
-      let parsedRange: { offset: number; length: number } | undefined;
+      let parsedRange: { offset: number; length: number; total?: number } | undefined;
       if (contentRange) {
         const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
         if (match) {
           const offset = Number.parseInt(match[1]!, 10);
           const end = Number.parseInt(match[2]!, 10);
-          parsedRange = { offset, length: end - offset + 1 };
+          parsedRange = { offset, length: end - offset + 1, total: Number.parseInt(match[3]!, 10) };
         }
       }
       return {
@@ -275,6 +279,57 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
     return getSignedUrl(this.client, new PutObjectCommand({ Bucket: this.bucket, Key: key }), {
       expiresIn: opts?.expiresInSeconds ?? 3600,
     });
+  }
+
+  async createMultipartUpload(key: string): Promise<string> {
+    const out = await this.client.send(
+      new CreateMultipartUploadCommand({ Bucket: this.bucket, Key: key }),
+    );
+    if (!out.UploadId) throw new Error('S3 did not return an upload id');
+    return out.UploadId;
+  }
+
+  async getSignedUploadPartUrl(
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    opts?: { expiresInSeconds?: number },
+  ): Promise<string> {
+    return getSignedUrl(
+      this.client,
+      new UploadPartCommand({
+        Bucket: this.bucket,
+        Key: key,
+        UploadId: uploadId,
+        PartNumber: partNumber,
+      }),
+      { expiresIn: opts?.expiresInSeconds ?? 3600 },
+    );
+  }
+
+  async completeMultipartUpload(
+    key: string,
+    uploadId: string,
+    parts: { partNumber: number; etag: string }[],
+  ): Promise<void> {
+    await this.client.send(
+      new CompleteMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: key,
+        UploadId: uploadId,
+        MultipartUpload: {
+          Parts: [...parts]
+            .sort((a, b) => a.partNumber - b.partNumber)
+            .map((p) => ({ PartNumber: p.partNumber, ETag: p.etag })),
+        },
+      }),
+    );
+  }
+
+  async abortMultipartUpload(key: string, uploadId: string): Promise<void> {
+    await this.client.send(
+      new AbortMultipartUploadCommand({ Bucket: this.bucket, Key: key, UploadId: uploadId }),
+    );
   }
 
   async ping(): Promise<{ ok: boolean; latencyMs: number; error?: string }> {

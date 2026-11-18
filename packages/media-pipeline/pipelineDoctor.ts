@@ -7,6 +7,7 @@ import { access, constants, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { createClient } from 'redis';
 import { checkEncoreHealth } from './encoreClient.js';
+import { resolveInboxDir } from './inboxDirs.js';
 import { isLoopbackEncoreUrl } from './packagerEncoreUrl.js';
 import { isLoopbackHost } from './supervisorAuth.js';
 
@@ -135,9 +136,7 @@ async function checkStorageConfigured(env: NodeJS.ProcessEnv): Promise<DoctorFin
         ),
       );
     } else {
-      out.push(
-        finding('storage.endpoint', 'ok', `S3 endpoint ${redactUrlCredentials(endpoint)}`),
-      );
+      out.push(finding('storage.endpoint', 'ok', `S3 endpoint ${redactUrlCredentials(endpoint)}`));
     }
   } else if (!hasAws && !hasB2) {
     out.push(
@@ -210,9 +209,7 @@ export async function runPipelineDoctor(
   }
 
   const encoreBase = (env.ENCORE_BASE_URL || 'http://127.0.0.1:8080').trim();
-  findings.push(
-    finding('encore.url', 'ok', `ENCORE_BASE_URL=${redactUrlCredentials(encoreBase)}`),
-  );
+  findings.push(finding('encore.url', 'ok', `ENCORE_BASE_URL=${redactUrlCredentials(encoreBase)}`));
   const packagerEncoreBase = env.PACKAGER_ENCORE_BASE_URL?.trim() || '';
   if (packagerEncoreBase) {
     const normalizedPackagerEncoreBase = packagerEncoreBase.includes('://')
@@ -253,7 +250,11 @@ export async function runPipelineDoctor(
 
   if (env.VMP_PIPELINE_DOCTOR_SKIP_LIVE === '1') {
     findings.push(
-      finding('encore.health', 'warn', 'Skipped live Encore check (VMP_PIPELINE_DOCTOR_SKIP_LIVE=1)'),
+      finding(
+        'encore.health',
+        'warn',
+        'Skipped live Encore check (VMP_PIPELINE_DOCTOR_SKIP_LIVE=1)',
+      ),
     );
     findings.push(
       finding('redis', 'warn', 'Skipped live Redis check (VMP_PIPELINE_DOCTOR_SKIP_LIVE=1)'),
@@ -278,8 +279,10 @@ export async function runPipelineDoctor(
 
   findings.push(...(await checkStorageConfigured(env)));
 
-  const inboxFast = env.INBOX_FAST_LANE_DIR || '/media/videos/inbox-fast-lane';
-  const inboxFull = env.INBOX_FULL_LADDER_DIR || '/media/videos/inbox-full-ladder';
+  // Same resolution the watcher uses — honors INBOX_DIR legacy fallback and
+  // explicit per-lane overrides.
+  const inboxFast = resolveInboxDir('fast_lane', env);
+  const inboxFull = resolveInboxDir('full_ladder', env);
   const tmpBase = env.TMP_DIR_BASE || '/media/tmp/video_pipeline';
   for (const [id, dir] of [
     ['inbox.fast', inboxFast],
