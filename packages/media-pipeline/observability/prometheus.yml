@@ -3,8 +3,9 @@ global:
 
 scrape_configs:
   # Supervisor: pipeline jobs, queue depth, worker registry, TTP, process stats.
-  # /metrics is protected by VMP_SUPERVISOR_DASHBOARD_SECRET — mount the secret
-  # into Prometheus (PROMETHEUS_BEARER_TOKEN_FILE) or pass --web.config for basic auth.
+  # /metrics requires VMP_SUPERVISOR_DASHBOARD_SECRET — scrape needs the same
+  # secret mounted at /etc/prometheus/secrets/dashboard_token (host file set via
+  # PROMETHEUS_DASHBOARD_TOKEN_FILE in .env).
   - job_name: vmp-supervisor
     authorization:
       type: Bearer

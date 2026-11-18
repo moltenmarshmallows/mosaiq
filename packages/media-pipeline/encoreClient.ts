@@ -298,6 +298,10 @@ export async function submitRenditionJobs(options: {
     const { profile, queueClass } = await resolveEncoreProfile(ENCORE_PROFILES[rendition]);
     const encoreOutDir = path.join(options.outputDir, 'encore', 'renditions', rendition);
     await mkdir(encoreOutDir, { recursive: true });
+    // Profile resolution + mkdir took time — cancel may have arrived meanwhile.
+    if (options.isCancelled?.()) {
+      throw new Error(`Rendition submission for ${options.videoId} cancelled`);
+    }
     const jobId = await submitEncoreJob({
       profile,
       inputPath: options.inputPath,

@@ -128,6 +128,7 @@ import {
   resolveMediaEntrypoint,
   sortMasterPlaylistByBandwidth,
 } from './mediaEntrypoints.js';
+import { getRequestPublicOrigin } from './requestPublicOrigin.js';
 import { resolveMetricHttpRoute } from './metricHttpRoutes.js';
 import {
   handleDevicePairingComplete,
@@ -1915,9 +1916,14 @@ async function handleVideoAccess(
     // would 404 — prefer the real uploaded source whenever no media exists.
     // Token is minted full-access for all viewers: a progressive MP4 can't be
     // segment-truncated server-side; the client-side paywall gates preview.
-    if (rawSourceKey && (!playlistUrl || !mediaFound) && allowAnonymousPlayable && env.JWT_SECRET) {
+    // status='draft' means the multipart session exists but hasn't committed —
+    // raw_source_key alone is not proof of a playable object.
+    const sourceCommitted = Boolean(rawSourceKey) && video?.status !== 'draft';
+    if (sourceCommitted && (!playlistUrl || !mediaFound) && allowAnonymousPlayable && env.JWT_SECRET) {
       const vt = await signVideoToken(effectiveUserId, playbackVideoId, env.JWT_SECRET, null);
-      progressiveUrl = `/api/video-proxy/${rawSourceKey}?vt=${encodeURIComponent(vt)}`;
+      // Absolute URL on the same public origin as playlistUrl — a root-relative
+      // path would resolve against the web origin, not the API.
+      progressiveUrl = `${getRequestPublicOrigin(request, env)}/api/video-proxy/${rawSourceKey}?vt=${encodeURIComponent(vt)}`;
       if (!mediaFound) playlistUrl = null;
     }
 

@@ -75,9 +75,14 @@ function storageOrNull(env: any): MultipartStorage | null {
 
 async function getVideoUploadState(env: any, videoId: string) {
   const row = (await getDb(env)
-    .prepare('SELECT id, raw_source_key, status FROM videos WHERE id = ?')
+    .prepare('SELECT id, raw_source_key, status, pipeline_mode FROM videos WHERE id = ?')
     .bind(videoId)
-    .first()) as { id?: string; raw_source_key?: string | null; status?: string } | null;
+    .first()) as {
+    id?: string;
+    raw_source_key?: string | null;
+    status?: string;
+    pipeline_mode?: string | null;
+  } | null;
   if (!row?.id) return null;
   return row;
 }
@@ -114,10 +119,16 @@ export async function handleAdminUploadCreate(request: Request, env: any, corsHe
   try {
     await getDb(env)
       .prepare(
-        `INSERT INTO videos (id, title, description, full_duration, preview_duration, status, publish_status, slug, raw_source_key, upload_date, updated_at)
-         VALUES (?, ?, '', 0, 0, 'processing', 'draft', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        `INSERT INTO videos (id, title, description, full_duration, preview_duration, status, publish_status, slug, raw_source_key, pipeline_mode, upload_date, updated_at)
+         VALUES (?, ?, '', 0, 0, 'draft', 'draft', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
       )
-      .bind(videoId, title, `raw-${crypto.randomUUID().slice(0, 8)}`, key)
+      .bind(
+        videoId,
+        title,
+        `raw-${crypto.randomUUID().slice(0, 8)}`,
+        key,
+        body?.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane',
+      )
       .run();
   } catch (err) {
     // Don't leak an untracked multipart session nobody can abort.
@@ -192,6 +203,15 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
   if (!key) {
     return jsonResponse({ error: 'Upload session not found', code: 'not_found' }, 404, corsHeaders);
   }
+  // Already advanced past first completion — report success without
+  // regressing status or re-notifying the pipeline.
+  if (video?.status === 'processed') {
+    return jsonResponse(
+      { ok: true, videoId, alreadyProcessed: true, ingest: { delivered: true } },
+      200,
+      corsHeaders,
+    );
+  }
 
   let head = await storage.headObject(key);
   if (!head?.size) {
@@ -210,9 +230,14 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
   }
 
   const pipelineMode = body?.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';
+  // Only a first completion may flip draft→processing; a raced second call
+  // must not reset a row that already advanced.
   await getDb(env)
-    .prepare(`UPDATE videos SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
-    .bind(videoId)
+    .prepare(
+      `UPDATE videos SET status = 'processing', pipeline_mode = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND status != 'processed'`,
+    )
+    .bind(pipelineMode, videoId)
     .run();
 
   const ingest = await deliverIngestWebhook(request, env, videoId, key, pipelineMode);
@@ -223,6 +248,7 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
 export async function handleAdminUploadIngest(request: Request, env: any, corsHeaders: any) {
   const authError = await requireEditor(request, env, corsHeaders);
   if (authError) return authError;
+  const storage = storageOrNull(env);
   const videoId = new URL(request.url).pathname.split('/').at(-2) || '';
   const video = await getVideoUploadState(env, videoId);
   const key = video?.raw_source_key;
@@ -230,10 +256,22 @@ export async function handleAdminUploadIngest(request: Request, env: any, corsHe
     return jsonResponse({ error: 'No raw source to ingest', code: 'not_found' }, 404, corsHeaders);
   }
   if (video?.status === 'processed') {
-    return jsonResponse({ error: 'Video already processed' }, 409, corsHeaders);
+    return jsonResponse({ error: 'Video already processed', code: 'already_processed' }, 409, corsHeaders);
+  }
+  // raw_source_key is set at session creation — verify the object actually
+  // committed before telling the pipeline to pull it.
+  const head = await storage?.headObject(key).catch(() => null);
+  if (!head?.size) {
+    return jsonResponse({ error: 'Upload not committed yet', code: 'not_committed' }, 409, corsHeaders);
   }
   const body = (await request.json().catch(() => null)) as { pipelineMode?: string } | null;
-  const ingest = await deliverIngestWebhook(request, env, videoId, key, body?.pipelineMode || 'fast_lane');
+  const mode =
+    body?.pipelineMode === 'full_ladder' || body?.pipelineMode === 'fast_lane'
+      ? body.pipelineMode
+      : video?.pipeline_mode === 'full_ladder'
+        ? 'full_ladder'
+        : 'fast_lane';
+  const ingest = await deliverIngestWebhook(request, env, videoId, key, mode);
   return jsonResponse(
     { ok: ingest.delivered, ingest },
     ingest.delivered ? 200 : 502,
@@ -246,6 +284,14 @@ export async function handleAdminUploadAbort(request: Request, env: any, corsHea
   const authError = await requireEditor(request, env, corsHeaders);
   if (authError) return authError;
   const storage = storageOrNull(env);
+  if (!storage?.abortMultipartUpload || !storage.headObject) {
+    // Cannot verify or cancel — leave the row untouched for a later retry.
+    return jsonResponse(
+      { error: 'Object storage does not support multipart abort', code: 'storage_unsupported' },
+      503,
+      corsHeaders,
+    );
+  }
   const videoId = new URL(request.url).pathname.split('/').at(-2) || '';
   const body = (await request.json().catch(() => null)) as { uploadId?: string } | null;
   if (!body?.uploadId) {
@@ -256,7 +302,7 @@ export async function handleAdminUploadAbort(request: Request, env: any, corsHea
     return jsonResponse({ error: 'Upload session not found', code: 'not_found' }, 404, corsHeaders);
   }
   // A completed upload is the playable source — refuse to detach it.
-  const head = await storage?.headObject(video.raw_source_key).catch(() => null);
+  const head = await storage.headObject(video.raw_source_key).catch(() => null);
   if (head?.size) {
     return jsonResponse(
       { error: 'Upload already completed; abort would orphan the playable source', code: 'already_completed' },
@@ -264,10 +310,13 @@ export async function handleAdminUploadAbort(request: Request, env: any, corsHea
       corsHeaders,
     );
   }
-  if (storage?.abortMultipartUpload) {
-    try {
-      await storage.abortMultipartUpload(video.raw_source_key, body.uploadId);
-    } catch {
+  try {
+    await storage.abortMultipartUpload(video.raw_source_key, body.uploadId);
+  } catch (err) {
+    // Provider says the session is already gone — that IS a cancelled upload.
+    const name = (err as { name?: string })?.name ?? '';
+    const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
+    if (name !== 'NoSuchUpload' && status !== 404) {
       return jsonResponse(
         { error: 'Abort failed in storage; session kept for retry', code: 'abort_failed' },
         502,
@@ -338,11 +387,15 @@ async function deliverIngestWebhook(
       },
       body: rawBody,
       redirect: 'error',
+      signal: AbortSignal.timeout(15_000),
     });
     return res.ok
       ? { delivered: true }
       : { delivered: false, code: 'ingest_rejected', status: res.status };
-  } catch {
-    return { delivered: false, code: 'ingest_unreachable' };
+  } catch (err) {
+    // Timeout ≠ non-acceptance — the supervisor may have ingested anyway.
+    // Surface it as a failed delivery so the admin UI offers retry.
+    const timedOut = err instanceof Error && err.name === 'TimeoutError';
+    return { delivered: false, code: timedOut ? 'ingest_timeout' : 'ingest_unreachable' };
   }
 }

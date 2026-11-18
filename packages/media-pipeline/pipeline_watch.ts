@@ -837,9 +837,9 @@ function reorderQueue(order: string[]): void {
 }
 
 type IpcCommand = {
-  cmd: 'pause' | 'resume' | 'stop' | 'reorder';
+  cmd: 'pause' | 'resume' | 'stop' | 'reorder' | 'intake';
   videoId?: string;
-  payload?: { order?: string[] };
+  payload?: { order?: string[]; file?: string; inboxDir?: string; pipelineMode?: string };
 };
 
 function handleIpcCommand(raw: string): { ok: boolean; error?: string } {
@@ -869,6 +869,17 @@ function handleIpcCommand(raw: string): { ok: boolean; error?: string } {
     const order = payload?.order;
     if (!Array.isArray(order)) return { ok: false, error: 'missing_order' };
     reorderQueue(order.map(String));
+    return { ok: true };
+  }
+  // Supervisor publishes completed uploads via link() — that emits no
+  // close_write/moved_to, so the watcher needs an explicit nudge. Re-sending
+  // an already-published name is safe: maybeEnqueueOnce dedupes queued/running
+  // jobs and requeues ones that failed.
+  if (cmd === 'intake') {
+    const file = String(payload?.file ?? '');
+    const watch = INBOX_WATCHES.find((w) => w.dir === String(payload?.inboxDir ?? ''));
+    if (!watch || !isInboxVideoBasename(file)) return { ok: false, error: 'invalid_intake' };
+    scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'supervisor_publish');
     return { ok: true };
   }
   return { ok: false, error: 'unknown_cmd' };

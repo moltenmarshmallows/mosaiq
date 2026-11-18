@@ -38,7 +38,12 @@ type RegistryRedisClient = ReturnType<typeof createRegistryClient>;
 function createRegistryClient() {
   return createClient({
     url: (process.env.REDIS_URL || 'redis://127.0.0.1:6379').trim(),
-    socket: { connectTimeout: 1500 },
+    socket: {
+      connectTimeout: 1500,
+      // No internal reconnect loop — connect() must reject promptly so the
+      // caller can fall back to memory and retry after REDIS_RETRY_COOLDOWN_MS.
+      reconnectStrategy: () => false,
+    },
   });
 }
 
@@ -151,7 +156,12 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
       memoryWorkers.delete(id);
       continue;
     }
-    if (!seen.has(id)) seen.set(id, record);
+    const existing = seen.get(id);
+    // Keep whichever record heartbeated most recently — a stale Redis copy
+    // must not mask a newer in-memory profile (and vice versa).
+    if (!existing || Date.parse(record.lastSeenAt) > Date.parse(existing.lastSeenAt)) {
+      seen.set(id, record);
+    }
   }
   return [...seen.values()].filter((r) => isWorkerAlive(r, nowMs));
 }

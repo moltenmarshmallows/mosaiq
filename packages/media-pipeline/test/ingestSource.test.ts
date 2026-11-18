@@ -97,3 +97,23 @@ test('rejects when VMP_API_BASE_URL is unset', () => {
     (e: unknown) => e instanceof IngestPlanError && e.code === 'ingest_not_configured',
   );
 });
+
+// Transport policy: matching origins are required so each case isolates scheme.
+// A non-loopback http source can never be exercised — its API base would fail
+// first — so coverage is loopback-accept + non-loopback-base-reject.
+test('accepts loopback http for local development', () => {
+  const api = 'http://127.0.0.1:8788';
+  const plan = planIngest(
+    { ...valid, sourceUrl: `${api}/api/video-proxy/videos/abc-123/source.mp4` },
+    api,
+    env,
+  );
+  assert.equal(plan.videoId, 'abc-123');
+});
+
+test('rejects a non-loopback http VMP_API_BASE_URL', () => {
+  assert.throws(
+    () => planIngest(valid, 'http://api.internal', env),
+    (e: unknown) => e instanceof IngestPlanError && e.code === 'ingest_not_configured',
+  );
+});

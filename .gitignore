@@ -44,5 +44,5 @@ Thumbs.db
 .nx/workspace-data
 .nx/polygraph
 .claude/worktrees
-.claude/settings.local.jsonpackages/media-pipeline/observability/dashboard-token.txt
+.claude/settings.local.json
 packages/media-pipeline/observability/dashboard-token.txt

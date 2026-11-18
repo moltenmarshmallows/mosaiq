@@ -58,13 +58,17 @@ b2 bucket update "$B2_BUCKET_NAME" allPrivate \
   --corsRules '[{"allowedOrigins":["https://staging.app.mosaiq.video","https://app.mosaiq.video"],"allowedOperations":["s3_put","s3_head","s3_get","s3_delete"],"allowedHeaders":["*"],"exposeHeaders":["ETag"],"maxAgeSeconds":3600}]'
 ```
 
-- Lifecycle: `bucket update --lifecycleRules` **replaces** the whole rule list — merge new rules with existing ones (`b2 bucket get`) instead of clobbering them. `daysFromStartingToCancelingUnfinishedLargeFiles` abandons multipart uploads after 7 days (the only leak presigning can leave). Add a hidden-version rule if desired (`daysFromHidingToDeleting`) — `bucket update` won't keep one unless it's in the array. Stray `source.*` objects can't be prefix-matched — the `fully_processed` callback deletes them; sweep `videos/*/source.*` manually if a video is deleted mid-encode.
+- Lifecycle: `bucket update --lifecycleRules` **replaces** the whole rule list — merge new rules with existing ones (`b2 bucket get`) instead of clobbering them. `daysFromStartingToCancelingUnfinishedLargeFiles` abandons multipart uploads after 7 days (the only leak presigning can leave). Reclaiming completed uploads: add `{"fileNamePrefix":"videos/","daysFromHidingToDeleting":N}` when your retention policy allows it — the `fully_processed` callback deletes current `source.*` objects, but **sweeping current object keys does not remove hidden versions**; only a hide→delete rule or deleting by version ID reclaims that storage.
 - CORS: **required** for the browser PUTs to B2's S3 endpoint and for reading the `ETag` back. If you name the rule (`corsRuleName`) via `b2 update bucket …`, keep the same name on updates or B2 appends a duplicate rule.
 
 ### Observability
 
 - `GET /metrics` on the supervisor — Prometheus exposition: queue depth, active jobs by stage, workers by backend, Encore/Redis health, last TTP, process stats.
-- `docker compose -f docker-compose.coordinator.yml --profile observability` — Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard. `/metrics` requires `VMP_SUPERVISOR_DASHBOARD_SECRET` when set: write the same secret to `observability/dashboard-token.txt` (gitignored) or override `PROMETHEUS_DASHBOARD_TOKEN_FILE`.
+- Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard. `/metrics` requires `VMP_SUPERVISOR_DASHBOARD_SECRET` when set — create the token file first, then start detached:
+  ```bash
+  printf '%s' "$VMP_SUPERVISOR_DASHBOARD_SECRET" > observability/dashboard-token.txt
+  docker compose -f docker-compose.coordinator.yml --env-file .env --profile observability up -d
+  ```
 - TTP events still land in the TTP JSONL log and DogStatsD (`DD_*`).
 
 ## Environment

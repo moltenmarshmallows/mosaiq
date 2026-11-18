@@ -519,9 +519,9 @@ let pipelineIpcPath: string | null = null;
 let pipelineRestartTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sendPipelineCommand(
-  cmd: 'pause' | 'resume' | 'stop' | 'reorder',
+  cmd: 'pause' | 'resume' | 'stop' | 'reorder' | 'intake',
   videoId?: string,
-  payload?: { order?: string[] },
+  payload?: { order?: string[]; file?: string; inboxDir?: string; pipelineMode?: string },
 ): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
     if (!pipelineIpcPath) {
@@ -551,6 +551,45 @@ function sendPipelineCommand(
     });
     client.on('error', (err) => finish({ ok: false, error: err.message }));
   });
+}
+
+/**
+ * Publish a completed upload into the inbox: hard link (atomic, never
+ * overwrites), then tell the watcher — link() emits no close_write/moved_to
+ * event so inotify alone can't see it. On EEXIST the file was already
+ * accepted: still send intake so a failed job gets requeued while a
+ * queued/running one dedupes inside maybeEnqueueOnce.
+ */
+async function publishToInbox(
+  srcPath: string,
+  destPath: string,
+  pipelineMode: string,
+): Promise<void> {
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+  let published = true;
+  try {
+    await fs.promises.link(srcPath, destPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    // Same inode → src and dest are already the same published file.
+    const [srcStat, destStat] = await Promise.all([
+      fs.promises.stat(srcPath),
+      fs.promises.stat(destPath).catch(() => null),
+    ]);
+    if (destStat && srcStat.dev === destStat.dev && srcStat.ino === destStat.ino) {
+      await fs.promises.rm(srcPath, { force: true });
+    }
+    published = false;
+  }
+  if (published) await fs.promises.rm(srcPath, { force: true });
+  const handoff = await sendPipelineCommand('intake', undefined, {
+    file: path.basename(destPath),
+    inboxDir: path.dirname(destPath),
+    pipelineMode,
+  });
+  if (!handoff.ok) {
+    pushLog(`intake handoff for ${path.basename(destPath)} failed (${handoff.error ?? 'unknown'}) — picked up on next watcher restart scan`);
+  }
 }
 
 function consumeIpcSocketLine(line: string): boolean {
@@ -1687,17 +1726,7 @@ const server = http.createServer(async (req, res) => {
         json(res, { ok: true, ignored: true });
         return;
       }
-      await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
-      try {
-        // link() is atomic and never overwrites an already-accepted inbox file.
-        await fs.promises.link(plan.srcPath, plan.destPath);
-        await fs.promises.rm(plan.srcPath, { force: true });
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
-          throw new Error(`inbox file ${plan.destBasename} already exists — refusing to overwrite`);
-        }
-        throw err;
-      }
+      await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
       increment('vmp.tus.upload.accepted', 1, { mode: plan.pipelineMode });
       pushLog(`tus upload → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
       json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
@@ -1763,6 +1792,8 @@ const server = http.createServer(async (req, res) => {
     try {
       const upstream = await fetch(plan.fetchUrl, { redirect: 'error' });
       if (!upstream.ok || !upstream.body) {
+        // Release the response body before returning — never leak the socket.
+        await upstream.body?.cancel().catch(() => {});
         json(
           res,
           { error: `source fetch failed: HTTP ${upstream.status}`, code: 'source_fetch_failed' },
@@ -1770,23 +1801,15 @@ const server = http.createServer(async (req, res) => {
         );
         return;
       }
-      // Stage outside the watched inbox (same /media filesystem), then publish
-      // via link() — atomic, and never clobbers a file the watcher accepted.
-      const stagingDir = path.join(
-        (process.env.TMP_DIR_BASE || '/mnt/tmp/video_pipeline').trim(),
-        '.ingest',
-      );
+      // Stage inside the destination inbox (hidden subdir the non-recursive
+      // watcher can't see) so link() is guaranteed same-filesystem, then
+      // publish atomically — never clobbering a file the watcher accepted.
+      const stagingDir = path.join(path.dirname(plan.destPath), '.ingest-staging');
       await fs.promises.mkdir(stagingDir, { recursive: true });
       const staged = path.join(stagingDir, `${plan.destBasename}.${crypto.randomUUID()}`);
       try {
         await writeObjectBodyToFile(upstream.body, staged);
-        await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
-        try {
-          await fs.promises.link(staged, plan.destPath);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-        }
-        await fs.promises.rm(staged, { force: true });
+        await publishToInbox(staged, plan.destPath, plan.pipelineMode);
       } catch (err) {
         await fs.promises.rm(staged, { force: true }).catch(() => {});
         throw err;

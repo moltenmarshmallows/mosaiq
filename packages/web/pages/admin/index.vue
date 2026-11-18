@@ -373,12 +373,12 @@
                 dismiss
               </button>
               <button
-                v-if="videoUploadProgress.state === 'done' && videoUploadIngestPending"
-                class="shrink-0 underline"
-                :disabled="videoUploadIngestRetrying"
-                @click="retryVideoIngest"
+                v-if="videoUploadProgress.state === 'done' && videoUploadProgress.videoId && pendingIngestVideoIds.has(videoUploadProgress.videoId)"
+                class="shrink-0 underline text-green-800 dark:text-green-300"
+                :disabled="videoUploadIngestRetrying === videoUploadProgress.videoId"
+                @click="retryVideoIngest(videoUploadProgress.videoId)"
               >
-                {{ videoUploadIngestRetrying ? 'retrying…' : 'retry encoder notification' }}
+                {{ videoUploadIngestRetrying === videoUploadProgress.videoId ? 'retrying…' : 'retry encoder notification' }}
               </button>
             </div>
             <div
@@ -580,6 +580,15 @@
                       <p class="text-xs text-gray-400 dark:text-gray-500 truncate">
                         {{ video.id }}
                       </p>
+                      <button
+                        v-if="pendingIngestVideoIds.has(video.id)"
+                        class="mt-0.5 text-xs underline text-amber-700 dark:text-amber-300 disabled:opacity-50"
+                        :disabled="videoUploadIngestRetrying === video.id"
+                        title="The encoder was never notified about this upload"
+                        @click="retryVideoIngest(video.id)"
+                      >
+                        {{ videoUploadIngestRetrying === video.id ? 'retrying…' : 'encoder not notified — retry' }}
+                      </button>
                       <!-- Vanity slug editor -->
                       <div class="mt-0.5 group/slug flex items-center gap-1 min-w-0">
                         <div
@@ -4334,8 +4343,33 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     error: null,
   });
   const videoUploadFileName = ref('');
-  const videoUploadIngestPending = ref(false);
-  const videoUploadIngestRetrying = ref(false);
+  // Video IDs whose ingest webhook failed — persisted so retry survives reload
+  // and a different upload doesn't clobber the pending state.
+  const INGEST_PENDING_KEY = 'vmp-ingest-pending';
+  const loadPendingIngest = (): Set<string> => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(INGEST_PENDING_KEY) || '[]') as string[]);
+    } catch {
+      return new Set();
+    }
+  };
+  const pendingIngestVideoIds = ref<Set<string>>(loadPendingIngest());
+  const videoUploadIngestRetrying = ref<string | null>(null);
+  const savePendingIngest = () => {
+    try {
+      localStorage.setItem(INGEST_PENDING_KEY, JSON.stringify([...pendingIngestVideoIds.value]));
+    } catch { /* best-effort */ }
+  };
+  const markIngestPending = (id: string) => {
+    pendingIngestVideoIds.value = new Set([...pendingIngestVideoIds.value, id]);
+    savePendingIngest();
+  };
+  const clearIngestPending = (id: string) => {
+    const next = new Set(pendingIngestVideoIds.value);
+    next.delete(id);
+    pendingIngestVideoIds.value = next;
+    savePendingIngest();
+  };
   const uploadPercent = computed(() =>
     videoUploadProgress.value.totalBytes > 0
       ? Math.min(
@@ -5800,9 +5834,11 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     if (!file) return;
     videoUploadFileName.value = file.name;
     try {
-      const resumed = videoUpload.resume(file);
+      const resumed = await videoUpload.resume(file);
       const result = await videoUpload.upload(file, { pipelineMode: 'fast_lane' });
-      videoUploadIngestPending.value = result?.ingestDelivered === false;
+      if (result?.ingestDelivered === false && result.videoId) {
+        markIngestPending(result.videoId);
+      }
       showToast(
         result?.ingestDelivered ? 'success' : 'error',
         !result?.ingestDelivered
@@ -5817,23 +5853,30 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     }
   };
 
-  const retryVideoIngest = async () => {
-    const videoId = videoUploadProgress.value.videoId;
-    if (!videoId) return;
-    videoUploadIngestRetrying.value = true;
+  const retryVideoIngest = async (videoId: string) => {
+    videoUploadIngestRetrying.value = videoId;
     try {
       await videoUpload.retryIngest(videoId);
-      videoUploadIngestPending.value = false;
+      clearIngestPending(videoId);
       showToast('success', 'Encoder notified — the video is queued for encoding.');
-    } catch {
-      showToast('error', 'Encoder still unreachable — try again later.');
+    } catch (err) {
+      const e = err as Error & { status?: number; code?: string };
+      if (e.code === 'already_processed') {
+        clearIngestPending(videoId);
+        showToast('success', 'Video already processed — nothing left to notify.');
+      } else if (e.code === 'not_committed') {
+        showToast('error', 'Upload has not finished committing yet — retry shortly.');
+      } else if (e.code === 'ingest_not_configured' || e.code === 'ingest_url_invalid') {
+        showToast('error', 'Ingest webhook is not configured on the API — check pipeline settings.');
+      } else {
+        showToast('error', 'Encoder still unreachable — try again later.');
+      }
     } finally {
-      videoUploadIngestRetrying.value = false;
+      videoUploadIngestRetrying.value = null;
     }
   };
 
   const dismissVideoUpload = () => {
-    videoUploadIngestPending.value = false;
     videoUploadProgress.value = {
       state: 'idle',
       bytesSent: 0,

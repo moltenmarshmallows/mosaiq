@@ -191,8 +191,14 @@ services:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
       # File must contain the VMP_SUPERVISOR_DASHBOARD_SECRET value so the
-      # scrape of /metrics passes the bearer token.
-      - ${PROMETHEUS_DASHBOARD_TOKEN_FILE:-./observability/dashboard-token.txt}:/etc/prometheus/secrets/dashboard_token:ro
+      # scrape of /metrics passes the bearer token. create_host_path: false
+      # makes a missing file fail instead of planting an empty host dir.
+      - type: bind
+        source: ${PROMETHEUS_DASHBOARD_TOKEN_FILE:-./observability/dashboard-token.txt}
+        target: /etc/prometheus/secrets/dashboard_token
+        read_only: true
+        bind:
+          create_host_path: false
 
   grafana:
     profiles: [observability]

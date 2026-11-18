@@ -80,8 +80,8 @@ export function planTusIntake(
   }
 
   const meta = upload?.meta_data ?? upload?.metadata ?? upload?.MetaData ?? {};
-  const rawName = path.basename(meta.filename || '').replace(/\.[^.]+$/, '');
-  let ext = path.extname(resolved) || path.extname(rawName) || '.mp4';
+  const originalName = path.basename(meta.filename || '');
+  let ext = path.extname(resolved) || path.extname(originalName) || '.mp4';
   if (!VIDEO_EXT.test(ext)) {
     throw new Error(`tus hook: unsupported extension ${ext}`);
   }
@@ -91,9 +91,18 @@ export function planTusIntake(
     meta.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';
   const videoIdHint = meta.videoId && SAFE_ID.test(meta.videoId) ? meta.videoId : undefined;
   // No hint: name by the unique upload id so same-named files can't collide.
-  const destBasename = videoIdHint
-    ? `${videoIdHint}${ext}`
-    : `${safeBasename(rawName) || safeBasename(uploadId)}-${safeBasename(uploadId)}${ext}`;
+  // Bound the stem so the full basename stays under the 255-byte FS limit.
+  let destBasename: string;
+  if (videoIdHint) {
+    destBasename = `${videoIdHint}${ext}`;
+  } else {
+    const suffix = `-${safeBasename(uploadId)}${ext}`;
+    const stem = (safeBasename(originalName.replace(/\.[^.]+$/, '')) || 'upload').slice(
+      0,
+      Math.max(1, 255 - suffix.length),
+    );
+    destBasename = `${stem}${suffix}`;
+  }
   const destPath = path.join(resolveInboxDir(pipelineMode, env), destBasename);
   return { srcPath: resolved, destPath, destBasename, pipelineMode, videoIdHint };
 }

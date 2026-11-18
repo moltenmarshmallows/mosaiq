@@ -27,6 +27,7 @@ type Session = {
   partSize: number;
   fileName: string;
   fileSize: number;
+  fingerprint: string;
   parts: Part[];
 };
 
@@ -40,13 +41,33 @@ export function useAdminVideoUpload(
   progress: Ref<AdminUploadProgress>,
 ) {
   const sessionKey = (file: File) =>
-    `${LS_PREFIX}${file.name}:${file.size}:${file.lastModified}`;
+    `${LS_PREFIX}${apiUrl}:${file.name}:${file.size}:${file.lastModified}`;
 
-  const loadSession = (file: File): Session | null => {
+  /** Cheap content check: hash head+tail so a same-named different file can't resume. */
+  const fingerprint = async (file: File): Promise<string> => {
+    try {
+      const head = await file.slice(0, 65536).arrayBuffer();
+      const tail = file.size > 65536 ? await file.slice(-65536).arrayBuffer() : new ArrayBuffer(0);
+      const sizeBytes = new TextEncoder().encode(String(file.size));
+      const buf = new Uint8Array(head.byteLength + tail.byteLength + sizeBytes.byteLength);
+      buf.set(new Uint8Array(head), 0);
+      buf.set(new Uint8Array(tail), head.byteLength);
+      buf.set(sizeBytes, head.byteLength + tail.byteLength);
+      const digest = await crypto.subtle.digest('SHA-256', buf);
+      return Array.from(new Uint8Array(digest).subarray(0, 8), (b) =>
+        b.toString(16).padStart(2, '0'),
+      ).join('');
+    } catch {
+      return `${file.name}:${file.size}:${file.lastModified}`;
+    }
+  };
+
+  const loadSession = async (file: File): Promise<Session | null> => {
     try {
       const raw = localStorage.getItem(sessionKey(file));
       const s = raw ? (JSON.parse(raw) as Session) : null;
-      return s && s.fileName === file.name && s.fileSize === file.size ? s : null;
+      if (!s || s.fileName !== file.name || s.fileSize !== file.size) return null;
+      return s.fingerprint === (await fingerprint(file)) ? s : null;
     } catch {
       return null;
     }
@@ -59,7 +80,13 @@ export function useAdminVideoUpload(
       /* quota-full: resume just won't survive a reload */
     }
   };
-  const clearSession = (file: File) => localStorage.removeItem(sessionKey(file));
+  const clearSession = (file: File) => {
+    try {
+      localStorage.removeItem(sessionKey(file));
+    } catch {
+      /* quota/security errors must never mask an upload result */
+    }
+  };
 
   const apiFetch = async (path: string, init: RequestInit = {}) => {
     const res = await fetch(`${apiUrl}${path}`, {
@@ -67,8 +94,17 @@ export function useAdminVideoUpload(
       headers: { ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...authHeader() },
     });
     if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as { error?: string } | null;
-      throw new Error(body?.error || `Upload API error ${res.status}`);
+      const body = (await res.json().catch(() => null)) as {
+        error?: string;
+        code?: string;
+      } | null;
+      const err = new Error(body?.error || `Upload API error ${res.status}`) as Error & {
+        status?: number;
+        code?: string;
+      };
+      err.status = res.status;
+      err.code = body?.code;
+      throw err;
     }
     return res.json();
   };
@@ -102,7 +138,7 @@ export function useAdminVideoUpload(
       error: null,
     };
     try {
-      let session = loadSession(file);
+      let session = await loadSession(file);
       if (!session) {
         const created = await apiFetch('/api/admin/videos/uploads', {
           method: 'POST',
@@ -118,6 +154,7 @@ export function useAdminVideoUpload(
           partSize: created.partSize,
           fileName: file.name,
           fileSize: file.size,
+          fingerprint: await fingerprint(file),
           parts: [],
         };
         saveSession(file, session);
@@ -156,7 +193,8 @@ export function useAdminVideoUpload(
             inFlight.delete(partNumber);
             // Server-side session gone (aborted/expire) — drop local state so
             // the next upload() starts a fresh session instead of retrying 404s.
-            if (err instanceof Error && /not found|404/i.test(err.message)) {
+            const e = err as Error & { status?: number; code?: string };
+            if (e.status === 404 || e.code === 'not_found') {
               clearSession(file);
               throw err;
             }
@@ -178,14 +216,23 @@ export function useAdminVideoUpload(
       );
 
       progress.value = { ...progress.value, state: 'completing' };
-      const completed = await apiFetch(`/api/admin/videos/uploads/${s.videoId}/complete`, {
-        method: 'POST',
-        body: JSON.stringify({
-          uploadId: s.uploadId,
-          pipelineMode: opts.pipelineMode ?? 'fast_lane',
-          parts: s.parts,
-        }),
-      });
+      let completed;
+      try {
+        completed = await apiFetch(`/api/admin/videos/uploads/${s.videoId}/complete`, {
+          method: 'POST',
+          body: JSON.stringify({
+            uploadId: s.uploadId,
+            pipelineMode: opts.pipelineMode ?? 'fast_lane',
+            parts: s.parts,
+          }),
+        });
+      } catch (err) {
+        // A definitive "session gone" lets the next file pick restart cleanly;
+        // transient/uncertain outcomes keep the saved parts for resume.
+        const e = err as Error & { status?: number; code?: string };
+        if (e.status === 404 || e.code === 'not_found') clearSession(file);
+        throw err;
+      }
       clearSession(file);
       progress.value = { ...progress.value, state: 'done', bytesSent: file.size };
       return { videoId: s.videoId, ingestDelivered: completed?.ingest?.delivered !== false };
@@ -199,7 +246,7 @@ export function useAdminVideoUpload(
     }
   };
 
-  const resume = (file: File) => loadSession(file) !== null;
+  const resume = async (file: File) => (await loadSession(file)) !== null;
 
   /** Re-notify the encoder for an upload whose ingest webhook failed. */
   const retryIngest = async (videoId: string) => {
@@ -207,12 +254,23 @@ export function useAdminVideoUpload(
   };
 
   const abort = async (file: File) => {
-    const s = loadSession(file);
+    const s = await loadSession(file);
     if (!s) return;
-    await apiFetch(`/api/admin/videos/uploads/${s.videoId}/abort`, {
-      method: 'POST',
-      body: JSON.stringify({ uploadId: s.uploadId }),
-    }).catch(() => undefined);
+    try {
+      await apiFetch(`/api/admin/videos/uploads/${s.videoId}/abort`, {
+        method: 'POST',
+        body: JSON.stringify({ uploadId: s.uploadId }),
+      });
+    } catch (err) {
+      // Confirmed gone server-side → drop the local session; any other failure
+      // keeps it so a later abort or resume can still reach the same upload.
+      const e = err as Error & { status?: number; code?: string };
+      if (e.status === 404 || e.code === 'not_found') {
+        clearSession(file);
+        return;
+      }
+      throw err;
+    }
     clearSession(file);
     progress.value = { state: 'idle', bytesSent: 0, totalBytes: 0, videoId: null, error: null };
   };
