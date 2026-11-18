@@ -120,7 +120,13 @@ export function useAdminVideoUpload(
       xhr.onload = () => {
         const etag = xhr.getResponseHeader('ETag');
         if (xhr.status >= 200 && xhr.status < 300 && etag) resolve(etag.replace(/"/g, ''));
-        else reject(new Error(`Part upload failed: HTTP ${xhr.status}`));
+        else {
+          const err = new Error(`Part upload failed: HTTP ${xhr.status}`) as Error & {
+            status?: number;
+          };
+          err.status = xhr.status;
+          reject(err);
+        }
       };
       xhr.onerror = () => reject(new Error('Part upload failed: network error'));
       xhr.send(blob);

@@ -64,6 +64,22 @@ else
     "ALTER TABLE magic_link_tokens ADD COLUMN otp_hash TEXT;"
 fi
 
+if column_exists videos raw_source_key; then
+  echo "[ensure-d1] videos.raw_source_key already present"
+else
+  echo "[ensure-d1] adding videos.raw_source_key"
+  npx wrangler d1 execute "$DB_NAME" "$MODE_FLAG" --command \
+    "ALTER TABLE videos ADD COLUMN raw_source_key TEXT;"
+fi
+
+if column_exists videos pipeline_mode; then
+  echo "[ensure-d1] videos.pipeline_mode already present"
+else
+  echo "[ensure-d1] adding videos.pipeline_mode"
+  npx wrangler d1 execute "$DB_NAME" "$MODE_FLAG" --command \
+    "ALTER TABLE videos ADD COLUMN pipeline_mode TEXT;"
+fi
+
 # Partial index is optional; ignore failure if the column was just added on a
 # dialect that rejects IF NOT EXISTS on indexes (D1 accepts it).
 npx wrangler d1 execute "$DB_NAME" "$MODE_FLAG" --command \

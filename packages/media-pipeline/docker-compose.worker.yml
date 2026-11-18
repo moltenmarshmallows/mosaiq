@@ -25,6 +25,9 @@ name: vmp-media-worker
 x-worker-env: &worker-env
   # Redis requires a password (coordinator sets --requirepass) — same
   # VMP_REDIS_PASSWORD as the coordinator's .env.
+  # shortcut: plaintext redis:// only over a trusted LAN/VPN; for untrusted
+  # links set WORKER_REDIS_URI=rediss://... against a TLS terminator in front
+  # of the coordinator's Redis (upgrade when Redis gains native TLS here).
   ENCORE_SETTINGS_REDIS_URI: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@${VMP_COORDINATOR:-redis}:6379}
   ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
   ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work

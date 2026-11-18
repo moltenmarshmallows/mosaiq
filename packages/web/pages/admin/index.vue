@@ -4355,20 +4355,27 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
   };
   const pendingIngestVideoIds = ref<Set<string>>(loadPendingIngest());
   const videoUploadIngestRetrying = ref<string | null>(null);
-  const savePendingIngest = () => {
+  // Read-modify-write per video so a second admin tab's entries survive —
+  // writing this tab's whole snapshot would clobber them.
+  const writePendingIngest = (id: string, pending: boolean) => {
     try {
-      localStorage.setItem(INGEST_PENDING_KEY, JSON.stringify([...pendingIngestVideoIds.value]));
+      const stored = new Set(
+        JSON.parse(localStorage.getItem(INGEST_PENDING_KEY) || '[]') as string[],
+      );
+      if (pending) stored.add(id);
+      else stored.delete(id);
+      localStorage.setItem(INGEST_PENDING_KEY, JSON.stringify([...stored]));
     } catch { /* best-effort */ }
   };
   const markIngestPending = (id: string) => {
     pendingIngestVideoIds.value = new Set([...pendingIngestVideoIds.value, id]);
-    savePendingIngest();
+    writePendingIngest(id, true);
   };
   const clearIngestPending = (id: string) => {
     const next = new Set(pendingIngestVideoIds.value);
     next.delete(id);
     pendingIngestVideoIds.value = next;
-    savePendingIngest();
+    writePendingIngest(id, false);
   };
   const uploadPercent = computed(() =>
     videoUploadProgress.value.totalBytes > 0

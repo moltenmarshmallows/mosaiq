@@ -229,7 +229,13 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
     return jsonResponse({ error: 'Uploaded object missing after complete' }, 502, corsHeaders);
   }
 
-  const pipelineMode = body?.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';
+  // An omitted mode keeps the one stored at upload creation — a bodyless
+  // complete must not silently downgrade a full_ladder upload to fast_lane.
+  const requested =
+    body?.pipelineMode === 'full_ladder' || body?.pipelineMode === 'fast_lane'
+      ? body.pipelineMode
+      : undefined;
+  const pipelineMode = requested ?? video?.pipeline_mode ?? 'fast_lane';
   // Only a first completion may flip draft→processing; a raced second call
   // must not reset a row that already advanced.
   await getDb(env)
@@ -301,8 +307,19 @@ export async function handleAdminUploadAbort(request: Request, env: any, corsHea
   if (!video?.raw_source_key) {
     return jsonResponse({ error: 'Upload session not found', code: 'not_found' }, 404, corsHeaders);
   }
-  // A completed upload is the playable source — refuse to detach it.
-  const head = await storage.headObject(video.raw_source_key).catch(() => null);
+  // A completed upload is the playable source — refuse to detach it. Only a
+  // confirmed-absent object may proceed to abort; a HEAD failure means the
+  // state is unknown, so keep the row and let the client retry.
+  let head;
+  try {
+    head = await storage.headObject(video.raw_source_key);
+  } catch {
+    return jsonResponse(
+      { error: 'Could not confirm upload state; retry', code: 'head_failed' },
+      503,
+      corsHeaders,
+    );
+  }
   if (head?.size) {
     return jsonResponse(
       { error: 'Upload already completed; abort would orphan the playable source', code: 'already_completed' },

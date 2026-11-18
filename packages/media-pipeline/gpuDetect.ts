@@ -121,24 +121,17 @@ export async function resolveSubmitBackend(): Promise<GpuBackend> {
   if (FORCE_GPU === 'cpu' || FORCE_GPU === 'none') return 'cpu';
 
   const counts = await liveWorkerBackendCounts();
-  // shortcut: Encore exposes one GPU queue class, so a vaapi-profile job pulled
-  // by an nvenc-only worker fails. Mixed GPU fleets are not routable today —
-  // submit to the majority backend; upgrade = per-backend worker queues.
+  // shortcut: Encore exposes one GPU queue class — a vaapi-profile job pulled
+  // by an nvenc-only worker fails, so a mixed fleet cannot run GPU profiles
+  // safely. Fall back to CPU until dequeue can enforce backend compatibility.
   if (counts.size > 1) {
     process.stderr.write(
-      `[gpu-detect] mixed GPU fleet (${[...counts].map(([b, n]) => `${b}:${n}`).join(', ')}) — routing to majority backend\n`,
+      `[gpu-detect] mixed GPU fleet (${[...counts].map(([b, n]) => `${b}:${n}`).join(', ')}) — routing to CPU\n`,
     );
+    return 'cpu';
   }
-  let best: GpuBackend = 'cpu';
-  let bestN = 0;
-  for (const backend of ['nvenc', 'vaapi'] as const) {
-    const n = counts.get(backend) ?? 0;
-    if (n > bestN) {
-      best = backend;
-      bestN = n;
-    }
-  }
-  return best;
+  const [backend] = counts.keys();
+  return backend ?? 'cpu';
 }
 
 export function gpuProfileSuffixFor(backend: GpuBackend): GpuEncodeConfig['profileSuffix'] {

@@ -2264,6 +2264,9 @@
     }
 
     try {
+      // Reset before every load so a previous video's resolved duration can't
+      // leak into the offline fallback (which sets fullDuration: null).
+      resolvedFullDuration.value = 0;
       try {
         await fetchVideoAccess({
           videoId: targetVideoId,
@@ -2637,7 +2640,18 @@
       // is encoding — take the element's real duration so seek/preview-lock UI works.
       const el = (nativeVideoWithListeners ?? getNativeVideoElement(video)) as HTMLMediaElement | null;
       const mediaDuration = el?.duration ?? 0;
-      if (!resolvedFullDuration.value && mediaDuration > 0) {
+      // Only trust the element duration on the progressive source — a clipped
+      // HLS preview reports the preview length and would shrink the
+      // full-duration UI.
+      const isProgressive =
+        !videoData.value?.video?.playlistUrl &&
+        typeof videoData.value?.video?.progressiveUrl === 'string';
+      if (
+        !resolvedFullDuration.value &&
+        isProgressive &&
+        Number.isFinite(mediaDuration) &&
+        mediaDuration > 0
+      ) {
         resolvedFullDuration.value = mediaDuration;
       }
       if (import.meta.env.DEV) {

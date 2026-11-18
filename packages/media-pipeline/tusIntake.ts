@@ -35,9 +35,17 @@ export type TusIntakePlan = {
   videoIdHint?: string;
 };
 
-// Only UUID stems survive the watcher verbatim (it renames anything else to a
-// random VIDEO_ID), so honoring a non-UUID hint would lose the association.
+// The watcher preserves UUID stems verbatim in random mode, and arbitrary
+// safe stems under VIDEO_ID_STRATEGY=filename — honoring a hint it would
+// rename would lose the upload↔video association.
 const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Under the default slug-hash sanitizer these stems pass through unchanged.
+const SLUG_SAFE_STEM = /^[a-z0-9-]{1,200}$/;
+
+function watcherPreservesStem(stem: string, env: NodeJS.ProcessEnv): boolean {
+  if (UUID_LIKE.test(stem)) return true;
+  return (env.VIDEO_ID_STRATEGY || 'random').trim() === 'filename' && SLUG_SAFE_STEM.test(stem);
+}
 const VIDEO_EXT = /\.(mp4|mkv|mov)$/i;
 
 function safeBasename(name: string): string {
@@ -91,7 +99,7 @@ export function planTusIntake(
 
   const pipelineMode: PipelineMode =
     meta.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';
-  if (meta.videoId && !UUID_LIKE.test(meta.videoId)) {
+  if (meta.videoId && !watcherPreservesStem(meta.videoId, env)) {
     throw new Error(`tus hook: unsupported videoId hint ${JSON.stringify(meta.videoId)}`);
   }
   const videoIdHint = meta.videoId || undefined;

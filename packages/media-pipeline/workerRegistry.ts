@@ -140,8 +140,11 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
   if (client) {
     try {
       for await (const keys of client.scanIterator({ MATCH: `${REDIS_KEY_PREFIX}*`, COUNT: 100 })) {
-        for (const key of keys) {
-          const raw = await client.get(String(key));
+        const batch = (keys as unknown[]).map(String);
+        if (batch.length === 0) continue;
+        // One round trip per scan page instead of one per worker.
+        const raws = await client.mGet(batch);
+        for (const raw of raws) {
           if (!raw) continue;
           const record = JSON.parse(String(raw)) as WorkerRecord;
           if (record?.workerId) seen.set(record.workerId, record);

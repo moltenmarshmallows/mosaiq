@@ -65,7 +65,7 @@ services:
     ports:
       - "${ENCORE_HTTP_BIND:-127.0.0.1}:8080:8080"
     environment:
-      ENCORE_SETTINGS_REDIS_URI: redis://redis:6379
+      ENCORE_SETTINGS_REDIS_URI: redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@redis:6379
       ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
       ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work
       ENCORE_SETTINGS_CONCURRENCY: "2"

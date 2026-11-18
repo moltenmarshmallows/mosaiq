@@ -562,13 +562,48 @@ function sendPipelineCommand(
  * accepted: still send intake so a failed job gets requeued while a
  * queued/running one dedupes inside maybeEnqueueOnce.
  */
+type InboxPublishOutcome = 'published' | 'same-file' | 'conflict';
+
+/** destPath → pipelineMode for handoffs the watcher hasn't acknowledged yet. */
+const pendingIntakeHandoffs = new Map<string, string>();
+
+async function sendIntakeHandoff(destPath: string, pipelineMode: string): Promise<void> {
+  const handoff = await sendPipelineCommand('intake', undefined, {
+    file: path.basename(destPath),
+    inboxDir: path.dirname(destPath),
+    pipelineMode,
+  });
+  if (handoff.ok) {
+    pendingIntakeHandoffs.delete(destPath);
+    return;
+  }
+  // The file IS in the inbox — a watcher restart scan picks it up, and the
+  // periodic drain retries meanwhile.
+  pendingIntakeHandoffs.set(destPath, pipelineMode);
+  pushLog(
+    `intake handoff for ${path.basename(destPath)} failed (${handoff.error ?? 'unknown'}) — queued for retry`,
+  );
+}
+
+function drainPendingIntakeHandoffs(): void {
+  for (const [destPath, pipelineMode] of [...pendingIntakeHandoffs]) {
+    void sendIntakeHandoff(destPath, pipelineMode);
+  }
+}
+
+/**
+ * Atomically publish srcPath into the inbox without clobbering an existing
+ * file. Returns 'published', 'same-file' (retry of an already-published
+ * upload — src is the same inode and is removed), or 'conflict' (a different
+ * file already owns the name — src is left for the caller to keep or clean).
+ */
 async function publishToInbox(
   srcPath: string,
   destPath: string,
   pipelineMode: string,
-): Promise<void> {
+): Promise<InboxPublishOutcome> {
   await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
-  let published = true;
+  let outcome: InboxPublishOutcome = 'published';
   try {
     await fs.promises.link(srcPath, destPath);
   } catch (err) {
@@ -580,18 +615,53 @@ async function publishToInbox(
     ]);
     if (destStat && srcStat.dev === destStat.dev && srcStat.ino === destStat.ino) {
       await fs.promises.rm(srcPath, { force: true });
+      outcome = 'same-file';
+    } else {
+      outcome = 'conflict';
     }
-    published = false;
   }
-  if (published) await fs.promises.rm(srcPath, { force: true });
-  const handoff = await sendPipelineCommand('intake', undefined, {
-    file: path.basename(destPath),
-    inboxDir: path.dirname(destPath),
-    pipelineMode,
-  });
-  if (!handoff.ok) {
-    pushLog(`intake handoff for ${path.basename(destPath)} failed (${handoff.error ?? 'unknown'}) — picked up on next watcher restart scan`);
+  if (outcome === 'published') await fs.promises.rm(srcPath, { force: true });
+  // No handoff on conflict — the existing file is a different upload.
+  if (outcome !== 'conflict') {
+    await sendIntakeHandoff(destPath, pipelineMode);
   }
+  return outcome;
+}
+
+/** destPath of ingest requests currently downloading/publishing. */
+const ingestInFlight = new Set<string>();
+
+/**
+ * Download + stage + publish an ingest source after the endpoint has already
+ * acked 202. A name conflict means a previous delivery already published this
+ * video — treat as delivered, not an error.
+ */
+async function runSourceIngest(plan: ReturnType<typeof planIngest>): Promise<void> {
+  const upstream = await fetch(plan.fetchUrl, { redirect: 'error' });
+  if (!upstream.ok || !upstream.body) {
+    // Release the response body before bailing — never leak the socket.
+    await upstream.body?.cancel().catch(() => {});
+    throw new Error(`source fetch failed: HTTP ${upstream.status}`);
+  }
+  // Stage inside the destination inbox (hidden subdir the non-recursive
+  // watcher can't see) so link() is guaranteed same-filesystem, then publish
+  // atomically — never clobbering a file the watcher accepted.
+  const stagingDir = path.join(path.dirname(plan.destPath), '.ingest-staging');
+  await fs.promises.mkdir(stagingDir, { recursive: true });
+  const staged = path.join(stagingDir, `${plan.destBasename}.${crypto.randomUUID()}`);
+  try {
+    await writeObjectBodyToFile(upstream.body, staged);
+    const outcome = await publishToInbox(staged, plan.destPath, plan.pipelineMode);
+    if (outcome === 'conflict') {
+      pushLog(`ingest: ${plan.destBasename} already published by an earlier delivery`);
+    }
+  } finally {
+    // The staging name is unique per request — remove it even when publish
+    // left it behind (conflict), but never the inbox file itself.
+    await fs.promises.rm(staged, { force: true }).catch(() => {});
+  }
+  increment('vmp.ingest.accepted', 1, { mode: plan.pipelineMode });
+  pushLog(`ingest → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
 }
 
 function consumeIpcSocketLine(line: string): boolean {
@@ -1699,13 +1769,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     // The packager authenticates with the per-job token embedded in its copy
-    // of encoreJobUrl — not the shared packager secret.
+    // of encoreJobUrl. Records queued before that rollout have no token and
+    // carry the shared secret instead — keep accepting it until they drain.
     const password = extractBasicAuthPassword(req);
-    if (
-      !record.aggregateToken ||
-      !password ||
-      !timingSafeEqualString(password, record.aggregateToken)
-    ) {
+    const authorized = record.aggregateToken
+      ? password !== null && timingSafeEqualString(password, record.aggregateToken)
+      : verifyPackagerCallbackSecret(req, packagerSecret || '');
+    if (!authorized) {
       json(res, { error: 'Unauthorized' }, 401);
       return;
     }
@@ -1740,7 +1810,14 @@ const server = http.createServer(async (req, res) => {
         json(res, { ok: true, ignored: true });
         return;
       }
-      await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      const outcome = await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      if (outcome === 'conflict') {
+        // A different upload already owns this destination — the source file
+        // stays in TUSD_DATA_DIR for operator reconciliation instead of being
+        // silently accepted as the wrong video.
+        json(res, { error: 'Destination already exists for a different upload', code: 'conflict' }, 409);
+        return;
+      }
       increment('vmp.tus.upload.accepted', 1, { mode: plan.pipelineMode });
       pushLog(`tus upload → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
       json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
@@ -1803,37 +1880,21 @@ const server = http.createServer(async (req, res) => {
       );
       return;
     }
-    try {
-      const upstream = await fetch(plan.fetchUrl, { redirect: 'error' });
-      if (!upstream.ok || !upstream.body) {
-        // Release the response body before returning — never leak the socket.
-        await upstream.body?.cancel().catch(() => {});
-        json(
-          res,
-          { error: `source fetch failed: HTTP ${upstream.status}`, code: 'source_fetch_failed' },
-          502,
-        );
-        return;
-      }
-      // Stage inside the destination inbox (hidden subdir the non-recursive
-      // watcher can't see) so link() is guaranteed same-filesystem, then
-      // publish atomically — never clobbering a file the watcher accepted.
-      const stagingDir = path.join(path.dirname(plan.destPath), '.ingest-staging');
-      await fs.promises.mkdir(stagingDir, { recursive: true });
-      const staged = path.join(stagingDir, `${plan.destBasename}.${crypto.randomUUID()}`);
-      try {
-        await writeObjectBodyToFile(upstream.body, staged);
-        await publishToInbox(staged, plan.destPath, plan.pipelineMode);
-      } catch (err) {
-        await fs.promises.rm(staged, { force: true }).catch(() => {});
-        throw err;
-      }
-      increment('vmp.ingest.accepted', 1, { mode: plan.pipelineMode });
-      pushLog(`ingest → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
-      json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
-    } catch (err) {
-      json(res, { error: err instanceof Error ? err.message : String(err) }, 502);
+    // Acknowledge the durable intake request immediately — the download can
+    // take minutes for large sources, so /complete must not wait for it.
+    // Deduped by destination: a concurrent retry of the same upload is a no-op.
+    const dedupeKey = plan.destPath;
+    if (!ingestInFlight.has(dedupeKey)) {
+      ingestInFlight.add(dedupeKey);
+      void runSourceIngest(plan)
+        .catch((err) =>
+          pushLog(
+            `ingest failed for ${plan.destBasename}: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        )
+        .finally(() => ingestInFlight.delete(dedupeKey));
     }
+    json(res, { ok: true, accepted: true, file: plan.destBasename, pipelineMode: plan.pipelineMode }, 202);
     return;
   }
 
@@ -2044,10 +2105,15 @@ async function recoverOrphanedTusUploads(): Promise<void> {
         MetaData?: Record<string, string>;
         Storage?: { Type?: string; Path?: string };
       };
+      // Ordinary uploads don't get their sidecar rewritten at completion, so
+      // Offset may lag — compare the stored file's real size instead.
+      const st = info.Storage?.Path
+        ? await fs.promises.stat(info.Storage.Path).catch(() => null)
+        : null;
       const complete =
-        info.IsFinal === true || (typeof info.Size === 'number' && info.Offset === info.Size);
+        info.IsFinal === true || (st !== null && typeof info.Size === 'number' && st.size === info.Size);
       // Already-consumed uploads leave a stale .info behind — skip quietly.
-      if (!complete || !info.Storage?.Path || !fs.existsSync(info.Storage.Path)) continue;
+      if (!complete || !st) continue;
       const plan = planTusIntake({
         Type: 'post-finish',
         Event: {
@@ -2059,7 +2125,11 @@ async function recoverOrphanedTusUploads(): Promise<void> {
         },
       });
       if (!plan) continue;
-      await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      const outcome = await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      if (outcome === 'conflict') {
+        pushLog(`tus recovery: ${entry} conflicts with an existing inbox file — needs operator review`);
+        continue;
+      }
       pushLog(`tus recovery: republished orphaned upload ${entry}`);
     } catch (err) {
       pushLog(
@@ -2106,6 +2176,7 @@ async function bootSupervisor(): Promise<void> {
   void recoverOrphanedTusUploads();
   setInterval(() => {
     reportSupervisorMetrics();
+    drainPendingIntakeHandoffs();
     if (pipelineChild && !pipelineState.exited && !hasStuckRunningJobs()) {
       void sdNotify('WATCHDOG=1');
     }
