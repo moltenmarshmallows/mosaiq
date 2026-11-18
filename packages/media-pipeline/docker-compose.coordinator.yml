@@ -65,7 +65,7 @@ services:
     ports:
       - "${ENCORE_HTTP_BIND:-127.0.0.1}:8080:8080"
     environment:
-      ENCORE_SETTINGS_REDIS_URI: redis://redis:6379
+      ENCORE_SETTINGS_REDIS_URI: redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@redis:6379
       ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
       ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work
       ENCORE_SETTINGS_CONCURRENCY: "2"
@@ -97,6 +97,11 @@ services:
       VMP_UI_PORT: "8788"
       VMP_ASSUME_DOCKER: "1"
       ENCORE_BASE_URL: http://encore-web:8080
+      # Origins rewritten into queued job URLs — the docker service names
+      # below only resolve inside this compose network. If a packager runs on
+      # another host, BOTH must point at addresses it can reach (e.g. the
+      # coordinator's LAN/TLS origin), or remote packagers can only serve
+      # aggregate jobs.
       PACKAGER_ENCORE_BASE_URL: ${PACKAGER_ENCORE_BASE_URL:-http://encore-web:8080}
       # Aggregate (rendition-split) job docs are served BY the supervisor.
       PACKAGER_SUPERVISOR_BASE_URL: ${PACKAGER_SUPERVISOR_BASE_URL:-http://vmp-supervisor:8788}

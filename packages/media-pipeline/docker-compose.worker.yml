@@ -25,11 +25,17 @@ name: vmp-media-worker
 x-worker-env: &worker-env
   # Redis requires a password (coordinator sets --requirepass) — same
   # VMP_REDIS_PASSWORD as the coordinator's .env.
+  # shortcut: plaintext redis:// only over a trusted LAN/VPN; for untrusted
+  # links set WORKER_REDIS_URI=rediss://... against a TLS terminator in front
+  # of the coordinator's Redis (upgrade when Redis gains native TLS here).
   ENCORE_SETTINGS_REDIS_URI: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@${VMP_COORDINATOR:-redis}:6379}
   ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
   ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work
   ENCORE_SETTINGS_CONCURRENCY: "2"
-  VMP_SUPERVISOR_URL: http://${VMP_COORDINATOR:-vmp-supervisor}:8788
+  # Supervisor base URL — passes through whatever the operator set (the
+  # heartbeat sends X-VMP-Worker-Token, so remote workers should point this at
+  # an https:// TLS terminator, not a cleartext http:// hop).
+  VMP_SUPERVISOR_URL: ${VMP_SUPERVISOR_URL:-http://${VMP_COORDINATOR:-vmp-supervisor}:8788}
   VMP_WORKER_TOKEN: ${VMP_WORKER_TOKEN:?Set VMP_WORKER_TOKEN in .env (shared with coordinator)}
   VMP_WORKER_HEARTBEAT_S: ${VMP_WORKER_HEARTBEAT_S:-30}
   ENCORE_WORKER_IDLE_SLEEP_S: ${ENCORE_WORKER_IDLE_SLEEP_S:-5}
@@ -88,6 +94,10 @@ services:
       - video
 
   # Optional local packager — drains the shared Redis packaging queue.
+  # Remote packagers: the queued Encore job URLs point at whatever
+  # PACKAGER_ENCORE_BASE_URL (normal jobs) / PACKAGER_SUPERVISOR_BASE_URL
+  # (aggregate jobs) the coordinator advertised — make sure this host can
+  # resolve them, or remote packagers only succeed on aggregate jobs.
   encore-packager:
     profiles: [packager]
     image: eyevinntechnology/encore-packager:latest

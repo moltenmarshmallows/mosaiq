@@ -66,7 +66,7 @@ heartbeat_loop() {
     if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
       curl -sf -m 5 -X POST "$SUPERVISOR_URL/api/workers/heartbeat" \
         -H "x-vmp-worker-token: $VMP_WORKER_TOKEN" -H 'content-type: application/json' \
-        -d "{\"workerId\":\"$WORKER_ID\",\"hostname\":\"$(hostname)\",\"gpuBackend\":\"$GPU_BACKEND\",\"pollQueue\":$ENCORE_SETTINGS_POLL_QUEUE,\"version\":\"${VMP_WORKER_VERSION:-docker}\"}" \
+        -d "{\"workerId\":\"$WORKER_ID\",\"hostname\":\"$(hostname)\",\"gpuBackend\":\"$GPU_BACKEND\",\"pollQueue\":$ENCORE_SETTINGS_POLL_QUEUE,\"pollHigherPrio\":$ENCORE_SETTINGS_POLL_HIGHER_PRIO,\"version\":\"${VMP_WORKER_VERSION:-docker}\"}" \
         >/dev/null 2>&1 || echo "heartbeat: supervisor unreachable" >&2
     fi
     sleep "$HEARTBEAT_S"

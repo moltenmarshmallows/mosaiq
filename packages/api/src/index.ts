@@ -153,7 +153,7 @@ import {
   handleRevokeDownload,
   handleRevokeOfflineDevice,
 } from './offlineDownloads.js';
-import { handleVideoPipelineStatus } from './pipelineStatus.js';
+import { handleVideoPipelineStatus, sweepOrphanedRawSources } from './pipelineStatus.js';
 import {
   handleAdminClearPlaybackPositions,
   handleDeletePlaybackPosition,
@@ -1298,6 +1298,11 @@ const workerHandler = {
           await processAccountDeletionJobs(env);
         } catch (err) {
           console.error('Account deletion sweep failed:', err);
+        }
+        try {
+          await sweepOrphanedRawSources(env);
+        } catch (err) {
+          console.error('Raw source cleanup sweep failed:', err);
         }
       }
 

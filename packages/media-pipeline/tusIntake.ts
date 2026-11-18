@@ -35,9 +35,28 @@ export type TusIntakePlan = {
   videoIdHint?: string;
 };
 
-// Only UUID stems survive the watcher verbatim (it renames anything else to a
-// random VIDEO_ID), so honoring a non-UUID hint would lose the association.
+// Only honor a MetaData.videoId hint the watcher will keep verbatim — a hint
+// that gets renamed or re-encoded loses the upload↔video association.
 const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SLUG_SAFE_STEM = /^[a-z0-9-]{1,200}$/;
+
+function watcherPreservesStem(stem: string, env: NodeJS.ProcessEnv): boolean {
+  const strategy = (env.VIDEO_ID_STRATEGY || 'random').trim();
+  if (strategy !== 'filename') {
+    // random strategy renames everything EXCEPT UUID stems, which are used
+    // verbatim (resolveInputTargetPath 'already_uuid').
+    return UUID_LIKE.test(stem);
+  }
+  const mode = (env.VIDEO_ID_SANITIZE_MODE || 'slug-hash').trim();
+  // base64url re-encodes every stem; none passes any stem through verbatim.
+  if (mode === 'base64url') return false;
+  if (mode === 'none') {
+    // Verbatim pass-through — still must be a single safe filename.
+    return stem === path.basename(stem) && stem !== '..' && stem.length <= 200;
+  }
+  // slug and slug-hash keep already-slug-safe stems unchanged (UUIDs included).
+  return SLUG_SAFE_STEM.test(stem);
+}
 const VIDEO_EXT = /\.(mp4|mkv|mov)$/i;
 
 function safeBasename(name: string): string {
@@ -91,7 +110,7 @@ export function planTusIntake(
 
   const pipelineMode: PipelineMode =
     meta.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';
-  if (meta.videoId && !UUID_LIKE.test(meta.videoId)) {
+  if (meta.videoId && !watcherPreservesStem(meta.videoId, env)) {
     throw new Error(`tus hook: unsupported videoId hint ${JSON.stringify(meta.videoId)}`);
   }
   const videoIdHint = meta.videoId || undefined;

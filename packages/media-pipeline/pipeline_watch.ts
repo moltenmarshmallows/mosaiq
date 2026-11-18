@@ -757,20 +757,47 @@ function inboxFileCacheKey(inboxDir: string, file: string): string {
   return `${inboxDir}::${file}`;
 }
 
+// Per-file in-flight guard: a stability timeout leaves the file un-claimed so
+// the next event/poll retries it without overlapping waits.
+const inflightIntake = new Map<string, Promise<void>>();
+
+/**
+ * Queue an intake; resolves true when the file was accepted, false on failure.
+ * The stability wait runs per-file (outside the shared chain) so one still-
+ * growing file can't head-of-line block unrelated intakes — only the final
+ * rename + enqueue is serialized.
+ */
 function scheduleInboxIntake(
   file: string,
   inboxDir: string,
   pipelineMode: PipelineMode,
   mechanism: string,
   awaitStable = false,
-): void {
-  inboxIntakeChain = inboxIntakeChain
-    .then(() => intakeInboxBasename(file, inboxDir, pipelineMode, mechanism, awaitStable))
-    .catch((err) => {
+): Promise<boolean> {
+  const cacheKey = inboxFileCacheKey(inboxDir, file);
+  const running = inflightIntake.get(cacheKey);
+  const task =
+    running ??
+    (async () => {
+      if (awaitStable) await waitStableSize(path.join(inboxDir, file));
+      inboxIntakeChain = inboxIntakeChain.then(() =>
+        intakeInboxBasename(file, inboxDir, pipelineMode, mechanism),
+      );
+      await inboxIntakeChain;
+    })();
+  if (!running) {
+    inflightIntake.set(cacheKey, task);
+    void task.finally(() => inflightIntake.delete(cacheKey));
+    void task.catch((err) => {
       log(
         `inbox intake failed for '${file}' (${inboxDir}): ${err instanceof Error ? err.message : String(err)}`,
       );
     });
+  }
+  return task.then(
+    () => true,
+    () => false,
+  );
 }
 
 async function intakeInboxBasename(
@@ -885,9 +912,15 @@ function handleIpcCommand(raw: string): { ok: boolean; error?: string } {
   // jobs and requeues ones that failed.
   if (cmd === 'intake') {
     const file = String(payload?.file ?? '');
-    const watch = INBOX_WATCHES.find((w) => w.dir === String(payload?.inboxDir ?? ''));
-    if (!watch || !isInboxVideoBasename(file)) return { ok: false, error: 'invalid_intake' };
-    scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'supervisor_publish');
+    const want = String(payload?.inboxDir ?? '');
+    // Normalize both sides — a configured dir with a trailing slash must still
+    // match the supervisor's dirname() result.
+    const watch = INBOX_WATCHES.find((w) => path.resolve(w.dir) === path.resolve(want));
+    // Basenames only — separators would let intake act outside the inbox.
+    if (!watch || !isInboxVideoBasename(file) || /[\\/]/.test(file)) {
+      return { ok: false, error: 'invalid_intake' };
+    }
+    void scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'supervisor_publish');
     return { ok: true };
   }
   return { ok: false, error: 'unknown_cmd' };
@@ -1045,7 +1078,15 @@ async function startupScan(): Promise<void> {
     await mkdir(watch.dir, { recursive: true });
     const entries = await readdir(watch.dir);
     for (const file of entries) {
-      await intakeInboxBasename(file, watch.dir, watch.pipelineMode, 'startup_scan', true);
+      // One still-growing file must not abort startup — it stays eligible for
+      // the next event or rescan.
+      try {
+        await intakeInboxBasename(file, watch.dir, watch.pipelineMode, 'startup_scan', true);
+      } catch (err) {
+        log(
+          `startup_scan skipped '${file}' (${watch.dir}): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
   if (queue.length > 0 || running > 0) {
@@ -1079,7 +1120,7 @@ function startWatcherForInbox(watch: InboxWatchConfig) {
       if (sp < 0) continue;
       const event = line.slice(0, sp);
       const file = line.slice(sp + 1);
-      scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'watchfolder', event === 'MOVED_TO');
+      void scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'watchfolder', event === 'MOVED_TO');
     }
   };
   child.stdout.on('data', (chunk) => {
@@ -1122,7 +1163,17 @@ function startPollingWatcher() {
         for (const file of entries) {
           if (known.has(file)) continue;
           if (!isInboxVideoBasename(file)) continue;
-          scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'polling_watchfolder', true);
+          void scheduleInboxIntake(
+            file,
+            watch.dir,
+            watch.pipelineMode,
+            'polling_watchfolder',
+            true,
+          ).then((accepted) => {
+            // A stability timeout leaves no event to retry on — un-mark the
+            // file so a later poll picks it up once the writer finishes.
+            if (!accepted) current.delete(file);
+          });
         }
         knownByInbox.set(watch.dir, current);
       }
@@ -1142,6 +1193,14 @@ function startPollingWatcher() {
 }
 
 async function main() {
+  // Both lanes sharing one inbox would misroute every publication: the IPC
+  // lookup and the startup scan pick the first matching watch (fast-lane).
+  if (path.resolve(INBOX_FAST_LANE_DIR) === path.resolve(INBOX_FULL_LADDER_DIR)) {
+    log(
+      `INBOX_FAST_LANE_DIR and INBOX_FULL_LADDER_DIR resolve to the same directory (${INBOX_FAST_LANE_DIR}) — refusing to start`,
+    );
+    process.exit(1);
+  }
   await startIpcServer();
   await checkEncoreHealth();
   log(`🎞️  Encore API: ${(process.env.ENCORE_BASE_URL || 'http://127.0.0.1:8080').trim()}`);
@@ -1149,11 +1208,12 @@ async function main() {
   for (const watch of INBOX_WATCHES) {
     log(`📥 Inbox [${watch.label}] pipelineMode=${watch.pipelineMode}: ${watch.dir}`);
   }
-  log('🔍 Resuming existing jobs...');
-  await startupScan();
   log('🎬 Watching for new uploads...');
   let watchers: Array<{ kill: (signal?: NodeJS.Signals) => boolean }> = [];
   let poller: { stop: () => void } | null = null;
+  // Install the watcher BEFORE the startup scan so a file moved in mid-scan
+  // still reaches intake (the event + scan paths dedupe through the same
+  // basename caches).
   try {
     watchers = startWatcher();
     log(
@@ -1165,6 +1225,8 @@ async function main() {
     );
     poller = startPollingWatcher();
   }
+  log('🔍 Resuming existing jobs...');
+  await startupScan();
 
   const shutdown = async () => {
     if (shuttingDown) return;

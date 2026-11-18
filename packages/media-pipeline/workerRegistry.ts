@@ -20,6 +20,12 @@ export type WorkerRecord = {
   gpuBackend: WorkerGpuBackend;
   /** Encore poll queue the worker is pinned to. */
   pollQueue: number;
+  /**
+   * Whether the worker also drains higher-priority queues (queue < pollQueue).
+   * Absent on records written before this field existed — treat as true for
+   * GPU workers, matching the entrypoint's historical default.
+   */
+  pollHigherPrio?: boolean;
   /** Worker image / entrypoint version tag, free-form. */
   version?: string;
   firstSeenAt: string;
@@ -52,6 +58,7 @@ let redisConnectPromise: Promise<RegistryRedisClient | null> | null = null;
 // Retry a failed Redis connect after a cooldown instead of latching memory-only.
 let redisRetryAfterMs = 0;
 const REDIS_RETRY_COOLDOWN_MS = 30_000;
+const REDIS_SCAN_TIMEOUT_MS = 4000;
 
 const memoryWorkers = new Map<string, WorkerRecord & { expiresAtMs: number }>();
 
@@ -134,14 +141,22 @@ export async function recordWorkerHeartbeat(
 }
 
 export async function listWorkers(): Promise<WorkerRecord[]> {
-  const nowMs = Date.now();
   const seen = new Map<string, WorkerRecord>();
   const client = await getRedis();
   if (client) {
+    // connectTimeout only bounds the handshake — a half-dead socket can hang a
+    // SCAN/MGET forever. Cap the whole read and drop the client on timeout so
+    // the next getRedis() reconnects instead of queueing behind a zombie.
+    const deadline = setTimeout(() => {
+      client.destroy();
+    }, REDIS_SCAN_TIMEOUT_MS);
     try {
       for await (const keys of client.scanIterator({ MATCH: `${REDIS_KEY_PREFIX}*`, COUNT: 100 })) {
-        for (const key of keys) {
-          const raw = await client.get(String(key));
+        const batch = (keys as unknown[]).map(String);
+        if (batch.length === 0) continue;
+        // One round trip per scan page instead of one per worker.
+        const raws = await client.mGet(batch);
+        for (const raw of raws) {
           if (!raw) continue;
           const record = JSON.parse(String(raw)) as WorkerRecord;
           if (record?.workerId) seen.set(record.workerId, record);
@@ -149,8 +164,13 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
       }
     } catch {
       /* fall through to memory */
+    } finally {
+      clearTimeout(deadline);
     }
   }
+  // Cut off AFTER the Redis reads — a worker whose lease expired mid-scan
+  // must not be returned as live.
+  const nowMs = Date.now();
   for (const [id, record] of memoryWorkers) {
     if (record.expiresAtMs <= nowMs) {
       memoryWorkers.delete(id);
@@ -191,6 +211,10 @@ export async function liveWorkerBackendCounts(): Promise<Map<WorkerGpuBackend, n
   const counts = new Map<WorkerGpuBackend, number>();
   for (const worker of await listWorkers()) {
     if (worker.gpuBackend === 'cpu') continue;
+    // Only workers that can claim queue 0 count as GPU capacity: a worker
+    // pinned to queue 1 without higher-prio polling never drains prio>=50
+    // jobs, so counting it would route GPU profiles into a void.
+    if (worker.pollQueue !== 0 && worker.pollHigherPrio === false) continue;
     counts.set(worker.gpuBackend, (counts.get(worker.gpuBackend) ?? 0) + 1);
   }
   return counts;

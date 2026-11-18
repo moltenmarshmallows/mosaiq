@@ -216,3 +216,41 @@ export async function handleVideoPipelineStatus(
     );
   }
 }
+
+/**
+ * Scheduled sweep: a transient deleteObject failure inside the
+ * fully_processed callback leaves raw_source_key set on a processed row and
+ * the callback still returns 200 — nothing else retries it. Rows in flight
+ * (not processed, or updated in the last hour) are never touched.
+ */
+export async function sweepOrphanedRawSources(env: PipelineEnv): Promise<number> {
+  const db = getDb(env);
+  const { results } = await db
+    .prepare(
+      `SELECT id, raw_source_key FROM videos
+       WHERE raw_source_key IS NOT NULL AND status = 'processed'
+         AND updated_at <= datetime('now', '-1 hour')
+       LIMIT 25`,
+    )
+    .all<{ id: string; raw_source_key: string }>();
+  if (!results?.length) return 0;
+  const storage = getObjectStorage(env as unknown as StorageEnv);
+  if (!storage) return 0;
+  let cleaned = 0;
+  for (const row of results) {
+    try {
+      await storage.deleteObject(row.raw_source_key);
+      await db.prepare('UPDATE videos SET raw_source_key = NULL WHERE id = ?').bind(row.id).run();
+      cleaned += 1;
+    } catch (e) {
+      log({
+        service: 'pipeline',
+        event: 'raw_source_sweep_failed',
+        level: 'warn',
+        video_id: row.id,
+        detail: String(e),
+      });
+    }
+  }
+  return cleaned;
+}

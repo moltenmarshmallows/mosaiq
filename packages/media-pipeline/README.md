@@ -14,17 +14,23 @@ VMP media orchestration around **[SVT Encore](https://svt.github.io/encore/)** �
 ```bash
 cd packages/media-pipeline
 cp .env.example .env   # fill secrets + B2 values
+# The media dirs below must exist + be writable by tusd (uid 1000) / supervisor:
+echo "ENCORE_MEDIA_MOUNT=$PWD/media" >> .env
+mkdir -p media/tus-uploads media/videos/inbox-fast-lane \
+  media/videos/inbox-full-ladder media/tmp/video_pipeline
 docker compose -f docker-compose.coordinator.yml --env-file .env up -d
 docker compose -f docker-compose.worker.yml      --env-file .env up -d
 ```
 
-Dashboard: `http://127.0.0.1:8788` (secret = `VMP_SUPERVISOR_DASHBOARD_SECRET`). Drop a `.mp4` into `$ENCORE_MEDIA_MOUNT/videos/inbox-fast-lane/` and watch it flow.
+Dashboard: `http://127.0.0.1:8788` (secret = `VMP_SUPERVISOR_DASHBOARD_SECRET`). Drop a `.mp4` into `media/videos/inbox-fast-lane/` and watch it flow.
 
 ### Scale out (LAN/cloud)
 
-1. On the worker host, mount the **same media tree** at `/media` (NFS export of the coordinator's media dir — same paths everywhere is the contract).
+1. On the worker host, mount the **same media tree** at the host path in `ENCORE_MEDIA_MOUNT` (default `/mnt` — set `ENCORE_MEDIA_MOUNT=/media` if you mounted NFS there). It is bind-mounted to `/media` inside containers — same paths everywhere is the contract.
 2. Copy `docker-compose.worker.yml` + `.env` over, set `VMP_COORDINATOR=<coordinator host/IP>` and `VMP_REDIS_BIND`/`VMP_UI_BIND` on the coordinator so Redis + supervisor are LAN-reachable.
 3. `docker network create vmp-media` once, then `docker compose -f docker-compose.worker.yml --env-file .env --profile nvidia up -d` (or `vaapi`, or plain CPU `worker`).
+
+Remote `--profile packager` instances need `PACKAGER_ENCORE_BASE_URL` + `PACKAGER_SUPERVISOR_BASE_URL` on the coordinator pointing at origins the worker host can resolve — with the Docker-name defaults they can only serve aggregate jobs.
 
 Every worker registers in the dashboard's **Encode workers** table and immediately adds concurrency. GPU workers drain GPU-class jobs first, then CPU work; CPU workers can never take a GPU-profile job.
 
@@ -56,19 +62,20 @@ Backblaze isn't in Terraform — configure the bucket once:
 
 ```bash
 b2 bucket update "$B2_BUCKET_NAME" allPrivate \
-  --lifecycleRules '[{"fileNamePrefix":"","daysFromStartingToCancelingUnfinishedLargeFiles":7}]' \
-  --corsRules '[{"allowedOrigins":["https://staging.app.mosaiq.video","https://app.mosaiq.video"],"allowedOperations":["s3_put","s3_head","s3_get","s3_delete"],"allowedHeaders":["*"],"exposeHeaders":["ETag"],"maxAgeSeconds":3600}]'
+  --lifecycle-rules '[{"fileNamePrefix":"","daysFromStartingToCancelingUnfinishedLargeFiles":7}]' \
+  --cors-rules '[{"corsRuleName":"mosaiq-browser-uploads","allowedOrigins":["https://staging.app.mosaiq.video","https://app.mosaiq.video"],"allowedOperations":["s3_put","s3_head","s3_get","s3_delete"],"allowedHeaders":["*"],"exposeHeaders":["ETag"],"maxAgeSeconds":3600}]'
 ```
 
-- Lifecycle: `bucket update --lifecycleRules` **replaces** the whole rule list — merge new rules with existing ones (`b2 bucket get`) instead of clobbering them. `daysFromStartingToCancelingUnfinishedLargeFiles` abandons multipart uploads after 7 days (the only leak presigning can leave). Reclaiming completed uploads: add `{"fileNamePrefix":"videos/","daysFromHidingToDeleting":N}` when your retention policy allows it — the `fully_processed` callback deletes current `source.*` objects, but **sweeping current object keys does not remove hidden versions**; only a hide→delete rule or deleting by version ID reclaims that storage.
-- CORS: **required** for the browser PUTs to B2's S3 endpoint and for reading the `ETag` back. If you name the rule (`corsRuleName`) via `b2 update bucket …`, keep the same name on updates or B2 appends a duplicate rule.
+- Lifecycle: `bucket update --lifecycle-rules` **replaces** the whole rule list — merge new rules with existing ones (`b2 bucket get`) instead of clobbering them. `daysFromStartingToCancelingUnfinishedLargeFiles` abandons multipart uploads after 7 days (the only leak presigning can leave). Reclaiming completed uploads: add `{"fileNamePrefix":"videos/","daysFromHidingToDeleting":N}` when your retention policy allows it — the `fully_processed` callback deletes current `source.*` objects, but **sweeping current object keys does not remove hidden versions**; only a hide→delete rule or deleting by version ID reclaims that storage.
+- CORS: **required** for the browser PUTs to B2's S3 endpoint and for reading the `ETag` back. The rule is named (`corsRuleName: mosaiq-browser-uploads`) — keep the same name on updates or B2 appends a duplicate rule.
 
 ### Observability
 
 - `GET /metrics` on the supervisor — Prometheus exposition: queue depth, active jobs by stage, workers by backend, Encore/Redis health, last TTP, process stats.
 - Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard. `/metrics` requires `VMP_SUPERVISOR_DASHBOARD_SECRET` when set — create the token file first, then start detached:
   ```bash
-  printf '%s' "$VMP_SUPERVISOR_DASHBOARD_SECRET" > observability/dashboard-token.txt
+  set -a; . ./.env; set +a   # load the same values Compose sees
+  printf '%s' "${VMP_SUPERVISOR_DASHBOARD_SECRET:?set VMP_SUPERVISOR_DASHBOARD_SECRET in .env first}" > observability/dashboard-token.txt
   docker compose -f docker-compose.coordinator.yml --env-file .env --profile observability up -d
   ```
 - TTP events still land in the TTP JSONL log and DogStatsD (`DD_*`).
