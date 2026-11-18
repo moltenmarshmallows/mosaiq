@@ -236,10 +236,12 @@ export function useAdminVideoUpload(
         }
       };
 
-      // Simple worker-pool over part numbers. poolFailed stops idle workers
-      // from claiming new parts once one rejects — already-started uploads
-      // finish, the first rejection still propagates.
+      // Simple worker-pool over part numbers. A rejection stops idle workers
+      // from claiming new parts; every already-started PUT is awaited before
+      // the error propagates, so completed siblings are saved for retry and no
+      // worker can write the session after upload() rejects.
       let poolFailed = false;
+      let firstError: unknown = null;
       const pending: number[] = [];
       for (let n = 1; n <= partCount; n++) if (!done.has(n)) pending.push(n);
       await Promise.all(
@@ -249,11 +251,12 @@ export function useAdminVideoUpload(
               await uploadPart(n);
             } catch (err) {
               poolFailed = true;
-              throw err;
+              firstError ??= err;
             }
           }
         }),
       );
+      if (firstError !== null) throw firstError;
 
       progress.value = { ...progress.value, state: 'completing' };
       let completed;

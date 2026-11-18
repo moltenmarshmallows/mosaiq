@@ -1218,8 +1218,10 @@ function startPollingWatcher() {
             true,
           ).then((accepted) => {
             // A stability timeout leaves no event to retry on — un-mark the
-            // file so a later poll picks it up once the writer finishes.
-            if (!accepted) current.delete(file);
+            // file so a later poll picks it up once the writer finishes. Must
+            // remove from the LIVE set: `current` is this cycle's snapshot and
+            // a later poll may already have replaced it in the map.
+            if (!accepted) knownByInbox.get(watch.dir)?.delete(file);
           });
         }
         knownByInbox.set(watch.dir, current);

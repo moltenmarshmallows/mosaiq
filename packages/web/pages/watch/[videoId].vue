@@ -2483,7 +2483,9 @@
         teardownVideoListeners();
         error.value = null;
         playbackUnavailable.value = true;
-        void loadBrowseRecommendations(options.signal);
+        // Awaited like the other unavailable paths — a detached promise would
+        // swallow a cancellation rejection that the enclosing catch handles.
+        await loadBrowseRecommendations(options.signal);
       }
       await recommendationsPromise.catch(() => undefined);
     } catch (e: any) {
