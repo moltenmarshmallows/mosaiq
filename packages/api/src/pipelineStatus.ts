@@ -250,6 +250,14 @@ export async function sweepOrphanedRawSources(env: PipelineEnv): Promise<number>
         video_id: row.id,
         detail: String(e),
       });
+      // Push the failed row past the 1-hour window — without a backoff the
+      // same poison rows head the LIMIT 25 batch every sweep and starve
+      // later eligible rows forever.
+      await db
+        .prepare('UPDATE videos SET updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .bind(row.id)
+        .run()
+        .catch(() => {});
     }
   }
   return cleaned;

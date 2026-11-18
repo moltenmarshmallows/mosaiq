@@ -1343,6 +1343,22 @@
     if (!descriptionExpanded.value) measureDescriptionClamp();
   });
 
+  /** Progressive fallback is only useful if this browser decodes the container. */
+  const canPlayProgressive = (url: string): boolean => {
+    const ext = (url.split('?')[0] ?? '').split('.').pop()?.toLowerCase() ?? '';
+    const mime = {
+      mp4: 'video/mp4',
+      m4v: 'video/mp4',
+      webm: 'video/webm',
+      mov: 'video/quicktime',
+    }[ext];
+    if (!mime) return false; // mkv etc. — wait for HLS instead of a hard fail
+    try {
+      return document.createElement('video').canPlayType(mime) !== '';
+    } catch {
+      return false;
+    }
+  };
   const formatDuration = (seconds: number) => {
     const total = Math.floor(seconds);
     const mins = Math.floor(total / 60);
@@ -2378,12 +2394,14 @@
         return;
       }
       const playlistUrl = videoData.value?.video?.playlistUrl;
-      // Raw upload still encoding → progressive MP4 through the same proxy.
-      const mediaUrl =
-        playlistUrl ||
-        (typeof videoData.value?.video?.progressiveUrl === 'string'
+      // Raw upload still encoding → progressive MP4 through the same proxy —
+      // but only when this browser can actually decode the container (a .mov
+      // or .mkv source would hard-fail on Chrome; better to wait for HLS).
+      const progressiveUrl =
+        typeof videoData.value?.video?.progressiveUrl === 'string'
           ? videoData.value.video.progressiveUrl
-          : null);
+          : null;
+      const mediaUrl = playlistUrl || (progressiveUrl && canPlayProgressive(progressiveUrl) ? progressiveUrl : null);
       // Warm cheapest rung + first segments while Video.js boots (and share Worker cache).
       if (playlistUrl && !rateLimited.value) {
         void import('~/utils/hlsStartupPrefetch')
@@ -2642,10 +2660,13 @@
       const mediaDuration = el?.duration ?? 0;
       // Only trust the element duration on the progressive source — a clipped
       // HLS preview reports the preview length and would shrink the
-      // full-duration UI.
-      const isProgressive =
-        !videoData.value?.video?.playlistUrl &&
-        typeof videoData.value?.video?.progressiveUrl === 'string';
+      // full-duration UI. Test what the element ACTUALLY loaded (currentSrc),
+      // not which URL fields the payload happened to carry.
+      const progressiveSrc =
+        typeof videoData.value?.video?.progressiveUrl === 'string'
+          ? videoData.value.video.progressiveUrl
+          : null;
+      const isProgressive = !!progressiveSrc && !!el?.currentSrc?.includes(progressiveSrc);
       if (
         !resolvedFullDuration.value &&
         isProgressive &&

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { resolveInboxDir } from './inboxDirs.js';
 import type { PipelineMode } from './pipelineMode.js';
+import { watcherPreservesStem } from './tusIntake.js';
 
 /**
  * Planning for POST /vmp/api/ingest: the API asks the pipeline to pull a raw
@@ -44,6 +45,14 @@ export function planIngest(
   const videoId = String(payload?.videoId || '').trim();
   if (!videoId || videoId.length > 128 || !SAFE_ID.test(videoId)) {
     throw new IngestPlanError('invalid_video_id', 'videoId must be a safe identifier');
+  }
+  // The published file must keep the API's videoId as its stem — otherwise the
+  // watcher renames it and the processed video loses its upload association.
+  if (!watcherPreservesStem(videoId, env)) {
+    throw new IngestPlanError(
+      'invalid_video_id',
+      'videoId would be renamed by the watcher config (VIDEO_ID_STRATEGY/SANITIZE_MODE)',
+    );
   }
   const pipelineMode: PipelineMode =
     payload?.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';

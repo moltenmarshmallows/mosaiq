@@ -12,6 +12,17 @@ WORKER_ID="${VMP_WORKER_ID:-$(hostname)}"
 FFMPEG="${FFMPEG_BIN:-ffmpeg}"
 VAAPI_DEVICE="${VAAPI_DEVICE:-/dev/dri/renderD128}"
 
+# Cleartext warnings — tokens/passwords over plain http/redis:// are only sane
+# inside the compose network or a trusted LAN/VPN.
+case "$SUPERVISOR_URL" in
+  http://vmp-supervisor*|http://localhost*|http://127.*|https://*) ;;
+  http://*) echo "heartbeat: WARNING — worker token over cleartext http to $SUPERVISOR_URL; use https:// or a VPN for remote links" >&2 ;;
+esac
+case "${WORKER_REDIS_URI:-redis://redis:6379}" in
+  redis://redis:*|redis://127.*|redis://localhost*|rediss://*|redis://*:6379) ;;
+  redis://*) echo "heartbeat: WARNING — redis password over cleartext redis://; use a tunnel/terminator for remote links" >&2 ;;
+esac
+
 probe() { # probe <label> <ffmpeg args...>
   label="$1"; shift
   if "$FFMPEG" -hide_banner -loglevel error "$@" -f null - 2>/dev/null; then
@@ -64,9 +75,20 @@ heartbeat_loop() {
     # fails at startup must not advertise GPU capacity it cannot use. The
     # registry TTL drops us once heartbeats stop.
     if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
+      # jq-encoded — a quote/backslash in WORKER_ID or VMP_WORKER_VERSION must
+      # not break the JSON body (or inject fields).
+      payload=$(jq -cn \
+        --arg workerId "$WORKER_ID" \
+        --arg hostname "$(hostname)" \
+        --arg gpuBackend "$GPU_BACKEND" \
+        --arg version "${VMP_WORKER_VERSION:-docker}" \
+        --argjson pollQueue "$ENCORE_SETTINGS_POLL_QUEUE" \
+        --argjson pollHigherPrio "$ENCORE_SETTINGS_POLL_HIGHER_PRIO" \
+        '{workerId:$workerId,hostname:$hostname,gpuBackend:$gpuBackend,pollQueue:$pollQueue,pollHigherPrio:$pollHigherPrio,version:$version}') \
+        || { echo "heartbeat: payload encode failed" >&2; sleep "$HEARTBEAT_S"; continue; }
       curl -sf -m 5 -X POST "$SUPERVISOR_URL/api/workers/heartbeat" \
         -H "x-vmp-worker-token: $VMP_WORKER_TOKEN" -H 'content-type: application/json' \
-        -d "{\"workerId\":\"$WORKER_ID\",\"hostname\":\"$(hostname)\",\"gpuBackend\":\"$GPU_BACKEND\",\"pollQueue\":$ENCORE_SETTINGS_POLL_QUEUE,\"pollHigherPrio\":$ENCORE_SETTINGS_POLL_HIGHER_PRIO,\"version\":\"${VMP_WORKER_VERSION:-docker}\"}" \
+        -d "$payload" \
         >/dev/null 2>&1 || echo "heartbeat: supervisor unreachable" >&2
     fi
     sleep "$HEARTBEAT_S"

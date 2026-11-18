@@ -58,7 +58,12 @@ let redisConnectPromise: Promise<RegistryRedisClient | null> | null = null;
 // Retry a failed Redis connect after a cooldown instead of latching memory-only.
 let redisRetryAfterMs = 0;
 const REDIS_RETRY_COOLDOWN_MS = 30_000;
+const REDIS_CONNECT_DEADLINE_MS = 5000;
 const REDIS_SCAN_TIMEOUT_MS = 4000;
+
+// True when the last Redis SCAN was cut short — partial fleet data must never
+// drive backend-specific profile selection (conservative CPU fallback).
+let lastScanIncomplete = false;
 
 const memoryWorkers = new Map<string, WorkerRecord & { expiresAtMs: number }>();
 
@@ -73,8 +78,12 @@ async function getRedis(): Promise<RegistryRedisClient | null> {
   if (redisConnectPromise) return redisConnectPromise;
 
   redisConnectPromise = (async () => {
+    const client = createRegistryClient();
+    // connectTimeout covers TCP establishment only — an endpoint that accepts
+    // the socket but never answers the handshake would hang every caller on
+    // this cached promise. Destroying the client makes connect() reject.
+    const deadline = setTimeout(() => client.destroy(), REDIS_CONNECT_DEADLINE_MS);
     try {
-      const client = createRegistryClient();
       client.on('error', (err) => {
         process.stderr.write(
           `[worker-registry] redis error: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -90,6 +99,7 @@ async function getRedis(): Promise<RegistryRedisClient | null> {
       redisRetryAfterMs = Date.now() + REDIS_RETRY_COOLDOWN_MS;
       return null;
     } finally {
+      clearTimeout(deadline);
       redisConnectPromise = null;
     }
   })();
@@ -162,7 +172,9 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
           if (record?.workerId) seen.set(record.workerId, record);
         }
       }
+      lastScanIncomplete = false;
     } catch {
+      lastScanIncomplete = true;
       /* fall through to memory */
     } finally {
       clearTimeout(deadline);
@@ -209,6 +221,11 @@ export async function liveWorkerBackends(): Promise<Set<WorkerGpuBackend>> {
 /** Live GPU-capable worker counts per backend (cpu excluded). */
 export async function liveWorkerBackendCounts(): Promise<Map<WorkerGpuBackend, number>> {
   const counts = new Map<WorkerGpuBackend, number>();
+  // A truncated SCAN under-counts a backend that is actually present — a
+  // backend-specific profile could then route to a fleet that can't run it.
+  // Report nothing until a full scan succeeds; resolveSubmitBackend falls
+  // back to CPU (the queue every worker polls).
+  if (lastScanIncomplete) return counts;
   for (const worker of await listWorkers()) {
     if (worker.gpuBackend === 'cpu') continue;
     // Only workers that can claim queue 0 count as GPU capacity: a worker

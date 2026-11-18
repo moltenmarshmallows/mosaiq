@@ -40,6 +40,9 @@ x-worker-env: &worker-env
   VMP_WORKER_HEARTBEAT_S: ${VMP_WORKER_HEARTBEAT_S:-30}
   ENCORE_WORKER_IDLE_SLEEP_S: ${ENCORE_WORKER_IDLE_SLEEP_S:-5}
   VMP_WORKER_VERSION: ${VMP_WORKER_VERSION:-docker}
+  # Optional: pin the registry identity / force a backend for testing.
+  VMP_WORKER_ID: ${VMP_WORKER_ID:-}
+  VMP_FORCE_BACKEND: ${VMP_FORCE_BACKEND:-}
 
 x-worker-common: &worker-common
   image: ${VMP_WORKER_IMAGE:-ghcr.io/moltenmarshmallows/vmp-encore-worker:latest}

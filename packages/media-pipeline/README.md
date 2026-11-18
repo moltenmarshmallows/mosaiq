@@ -34,6 +34,10 @@ Remote `--profile packager` instances need `PACKAGER_ENCORE_BASE_URL` + `PACKAGE
 
 Every worker registers in the dashboard's **Encode workers** table and immediately adds concurrency. GPU workers drain GPU-class jobs first, then CPU work; CPU workers can never take a GPU-profile job.
 
+> **Deploy cutover:** swapping the coordinator stack does not migrate jobs already queued in the old Redis — drain the queue (dashboard queue depth → 0) or accept that in-flight jobs stay with the old stack until it is shut down. Workers are stateless and can be scaled/replaced anytime.
+
+> **GPU fleet caveat:** jobs already queued on a GPU-class queue keep their target backend — a `*-gpu-vaapi` job will wait for a vaapi worker even if the fleet later becomes nvenc-only. Backend choice happens at submit time from the live registry.
+
 > **Credentials on untrusted links:** the supervisor speaks plain HTTP — packager/tusd callbacks (`CALLBACK_URL`, `-hooks-http`) and worker heartbeats carry secrets in URLs/headers. Inside the `vmp-media` network that's fine, but if any callback crosses a host boundary over an untrusted network, put a TLS-terminating reverse proxy in front of the supervisor and point `PACKAGER_CALLBACK_URL`/hooks/`VMP_SUPERVISOR_URL` at `https://…`. Redis is protected by `VMP_REDIS_PASSWORD` but is not encrypted — same rule applies (`WORKER_REDIS_URI` can carry `rediss://` if you tunnel).
 
 ### How capability routing works
@@ -74,8 +78,10 @@ b2 bucket update "$B2_BUCKET_NAME" allPrivate \
 - `GET /metrics` on the supervisor — Prometheus exposition: queue depth, active jobs by stage, workers by backend, Encore/Redis health, last TTP, process stats.
 - Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard. `/metrics` requires `VMP_SUPERVISOR_DASHBOARD_SECRET` when set — create the token file first, then start detached:
   ```bash
-  set -a; . ./.env; set +a   # load the same values Compose sees
-  printf '%s' "${VMP_SUPERVISOR_DASHBOARD_SECRET:?set VMP_SUPERVISOR_DASHBOARD_SECRET in .env first}" > observability/dashboard-token.txt
+  # Read the value straight from .env — sourcing the file can break on values
+  # with spaces/quotes, and unset/empty must abort before writing the token.
+  secret=$(grep -E '^VMP_SUPERVISOR_DASHBOARD_SECRET=' .env | cut -d= -f2-)
+  printf '%s' "${secret:?set VMP_SUPERVISOR_DASHBOARD_SECRET in .env first}" > observability/dashboard-token.txt
   docker compose -f docker-compose.coordinator.yml --env-file .env --profile observability up -d
   ```
 - TTP events still land in the TTP JSONL log and DogStatsD (`DD_*`).

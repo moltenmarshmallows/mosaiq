@@ -323,7 +323,7 @@
                 @change="handleVideoUploadPick"
               />
               <button
-                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold disabled:opacity-50"
+                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-blue-600 hover:bg-blue-700 dark:bg-blue-600 dark:hover:bg-blue-700 text-white dark:text-white text-sm font-semibold disabled:opacity-50"
                 :disabled="videoUploadProgress.state === 'creating' || videoUploadProgress.state === 'uploading' || videoUploadProgress.state === 'completing'"
                 @click="videoUploadInput?.click()"
               >
@@ -331,7 +331,7 @@
                 Upload video
               </button>
               <button
-                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold"
+                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-purple-600 hover:bg-purple-700 dark:bg-purple-600 dark:hover:bg-purple-700 text-white dark:text-white text-sm font-semibold"
                 @click="openLivestreamModal"
               >
                 <span class="text-base leading-none">+</span>
@@ -367,7 +367,7 @@
               </span>
               <button
                 v-if="videoUploadProgress.state === 'error'"
-                class="shrink-0 underline"
+                class="shrink-0 underline text-gray-700 dark:text-gray-200"
                 @click="dismissVideoUpload"
               >
                 dismiss
@@ -4343,28 +4343,35 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     error: null,
   });
   const videoUploadFileName = ref('');
-  // Video IDs whose ingest webhook failed — persisted so retry survives reload
-  // and a different upload doesn't clobber the pending state.
-  const INGEST_PENDING_KEY = 'vmp-ingest-pending';
+  // Video IDs whose ingest webhook failed — one localStorage key per video so
+  // concurrent admin tabs can never clobber each other's pending set (a shared
+  // array still races between one tab's read and its write).
+  const INGEST_PENDING_PREFIX = 'vmp-ingest-pending:';
   const loadPendingIngest = (): Set<string> => {
+    const ids = new Set<string>();
     try {
-      return new Set(JSON.parse(localStorage.getItem(INGEST_PENDING_KEY) || '[]') as string[]);
-    } catch {
-      return new Set();
-    }
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k?.startsWith(INGEST_PENDING_PREFIX)) {
+          ids.add(k.slice(INGEST_PENDING_PREFIX.length));
+        }
+      }
+      // Migrate the retired shared-array key, then drop it.
+      const legacy = JSON.parse(localStorage.getItem('vmp-ingest-pending') || '[]');
+      for (const id of legacy as string[]) {
+        ids.add(id);
+        localStorage.setItem(`${INGEST_PENDING_PREFIX}${id}`, '1');
+      }
+      localStorage.removeItem('vmp-ingest-pending');
+    } catch { /* best-effort */ }
+    return ids;
   };
   const pendingIngestVideoIds = ref<Set<string>>(loadPendingIngest());
   const videoUploadIngestRetrying = ref<string | null>(null);
-  // Read-modify-write per video so a second admin tab's entries survive —
-  // writing this tab's whole snapshot would clobber them.
   const writePendingIngest = (id: string, pending: boolean) => {
     try {
-      const stored = new Set(
-        JSON.parse(localStorage.getItem(INGEST_PENDING_KEY) || '[]') as string[],
-      );
-      if (pending) stored.add(id);
-      else stored.delete(id);
-      localStorage.setItem(INGEST_PENDING_KEY, JSON.stringify([...stored]));
+      if (pending) localStorage.setItem(`${INGEST_PENDING_PREFIX}${id}`, '1');
+      else localStorage.removeItem(`${INGEST_PENDING_PREFIX}${id}`);
     } catch { /* best-effort */ }
   };
   const markIngestPending = (id: string) => {

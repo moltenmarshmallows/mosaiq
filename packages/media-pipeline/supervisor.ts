@@ -631,13 +631,70 @@ async function publishToInbox(
 /** destPath of ingest requests currently downloading/publishing. */
 const ingestInFlight = new Set<string>();
 
+// tusd re-fires post-finish when our hook response is lost; by then publish
+// already moved the filestore source, so planTusIntake throws 'upload file
+// missing'. Tombstones in .published/ make repeat hooks (and restarts)
+// idempotent while 409 stays for a different upload claiming the name.
+const TUS_PUBLISHED_DIR_NAME = '.published';
+const TUS_PUBLISHED_LIMIT = 4096;
+
+function tusPublishedDir(): string {
+  return path.join(tusdDataDir(process.env), TUS_PUBLISHED_DIR_NAME);
+}
+
+function tusPublishedPath(uploadId: string): string {
+  // Filestore IDs are alnum+hyphen; keep a whitelist anyway since this joins a path.
+  return path.join(tusPublishedDir(), uploadId.replace(/[^a-zA-Z0-9_-]/g, '_'));
+}
+
+async function tusPublishedDestination(uploadId: string): Promise<string | null> {
+  try {
+    return (await fs.promises.readFile(tusPublishedPath(uploadId), 'utf8')).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function recordTusPublished(uploadId: string, destBasename: string): Promise<void> {
+  try {
+    const dir = tusPublishedDir();
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(tusPublishedPath(uploadId), destBasename, 'utf8');
+    // Bound tombstone growth — FIFO sweep of the oldest entries.
+    const entries = (await fs.promises.readdir(dir)).filter((e) => e !== '.' && e !== '..');
+    if (entries.length > TUS_PUBLISHED_LIMIT) {
+      const stats = await Promise.all(
+        entries.slice(0, entries.length - TUS_PUBLISHED_LIMIT).map(async (e) => ({
+          name: e,
+          mtime: (await fs.promises.stat(path.join(dir, e))).mtimeMs,
+        })),
+      );
+      stats.sort((a, b) => a.mtime - b.mtime);
+      for (const s of stats.slice(0, entries.length - TUS_PUBLISHED_LIMIT)) {
+        await fs.promises.rm(path.join(dir, s.name), { force: true }).catch(() => {});
+      }
+    }
+  } catch {
+    /* a lost tombstone only means a repeat hook re-uses planTusIntake */
+  }
+}
+
 /**
  * Download + stage + publish an ingest source after the endpoint has already
  * acked 202. A name conflict means a previous delivery already published this
  * video — treat as delivered, not an error.
  */
 async function runSourceIngest(plan: ReturnType<typeof planIngest>): Promise<void> {
-  const upstream = await fetch(plan.fetchUrl, { redirect: 'error' });
+  // No deadline otherwise: a stalled proxy download would pin ingestInFlight
+  // forever and turn every retry of this upload into a deduped no-op.
+  const timeoutMs = Math.max(
+    30_000,
+    Number(process.env.VMP_INGEST_DOWNLOAD_TIMEOUT_MS || 10 * 60 * 1000),
+  );
+  const upstream = await fetch(plan.fetchUrl, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   if (!upstream.ok || !upstream.body) {
     // Release the response body before bailing — never leak the socket.
     await upstream.body?.cancel().catch(() => {});
@@ -653,7 +710,11 @@ async function runSourceIngest(plan: ReturnType<typeof planIngest>): Promise<voi
     await writeObjectBodyToFile(upstream.body, staged);
     const outcome = await publishToInbox(staged, plan.destPath, plan.pipelineMode);
     if (outcome === 'conflict') {
-      pushLog(`ingest: ${plan.destBasename} already published by an earlier delivery`);
+      increment('vmp.ingest.conflict', 1, { mode: plan.pipelineMode });
+      pushLog(
+        `ingest conflict: ${plan.destBasename} — destination already published by a different source; manual reconciliation needed`,
+      );
+      return;
     }
   } finally {
     // The staging name is unique per request — remove it even when publish
@@ -1757,7 +1818,10 @@ const server = http.createServer(async (req, res) => {
       !WORKER_BACKENDS.has(gpuBackend) ||
       !Number.isInteger(pollQueue) ||
       pollQueue < 0 ||
-      pollQueue > 16
+      pollQueue > 16 ||
+      // Reject rather than coerce a malformed capability — a truthy string
+      // would silently register a worker as higher-prio-capable.
+      (body?.pollHigherPrio !== undefined && typeof body.pollHigherPrio !== 'boolean')
     ) {
       json(res, { error: 'Invalid worker heartbeat' }, 400);
       return;
@@ -1827,6 +1891,21 @@ const server = http.createServer(async (req, res) => {
     }
     const body = await readJsonBody(req);
     try {
+      const uploadId = String(
+        (body as { Event?: { Upload?: { ID?: string } } })?.Event?.Upload?.ID ??
+          (body as { event?: { upload?: { id?: string } } })?.event?.upload?.id ??
+          '',
+      );
+      // Durable replay dedupe — after a successful publish the filestore
+      // source is gone, so a replayed hook must be answered from the tombstone
+      // before planTusIntake can touch the (now-missing) file.
+      if (uploadId) {
+        const published = await tusPublishedDestination(uploadId);
+        if (published) {
+          json(res, { ok: true, file: published, replayed: true });
+          return;
+        }
+      }
       const plan = planTusIntake(body as Parameters<typeof planTusIntake>[0]);
       if (!plan) {
         json(res, { ok: true, ignored: true });
@@ -1840,6 +1919,7 @@ const server = http.createServer(async (req, res) => {
         json(res, { error: 'Destination already exists for a different upload', code: 'conflict' }, 409);
         return;
       }
+      if (uploadId) await recordTusPublished(uploadId, plan.destBasename);
       increment('vmp.tus.upload.accepted', 1, { mode: plan.pipelineMode });
       pushLog(`tus upload → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
       json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
@@ -2125,12 +2205,16 @@ async function recoverOrphanedTusUploads(): Promise<void> {
       const info = JSON.parse(await fs.promises.readFile(path.join(tusdDataDir(), entry), 'utf8')) as {
         ID?: string;
         IsFinal?: boolean;
+        IsPartial?: boolean;
         Offset?: number;
         Size?: number;
         SizeIsDeferred?: boolean;
         MetaData?: Record<string, string>;
         Storage?: { Type?: string; Path?: string };
       };
+      // A leftover .info from an already-published upload — the source file
+      // was moved out; the tombstone is the record of delivery.
+      if (info.ID && (await tusPublishedDestination(info.ID))) continue;
       // Completion proof = the stored file matching a declared, non-deferred
       // length. Offset in the sidecar can lag (filestore keeps it in memory),
       // IsFinal alone doesn't prove concatenation finished, and a deferred
@@ -2146,11 +2230,13 @@ async function recoverOrphanedTusUploads(): Promise<void> {
         st.size === info.Size;
       // Already-consumed uploads leave a stale .info behind — skip quietly.
       if (!complete || !st) continue;
+      const uploadId = info.ID ?? entry.replace(/\.info$/, '');
       const plan = planTusIntake({
         Type: 'post-finish',
         Event: {
           Upload: {
-            ID: info.ID ?? entry.replace(/\.info$/, ''),
+            ID: uploadId,
+            IsPartial: info.IsPartial,
             MetaData: info.MetaData,
             Storage: info.Storage,
           },
@@ -2162,6 +2248,7 @@ async function recoverOrphanedTusUploads(): Promise<void> {
         pushLog(`tus recovery: ${entry} conflicts with an existing inbox file — needs operator review`);
         continue;
       }
+      await recordTusPublished(uploadId, plan.destBasename);
       pushLog(`tus recovery: republished orphaned upload ${entry}`);
     } catch (err) {
       pushLog(

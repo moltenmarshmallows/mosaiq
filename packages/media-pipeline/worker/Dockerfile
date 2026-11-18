@@ -16,6 +16,7 @@ RUN apt-get update \
     ca-certificates \
     curl \
     ffmpeg \
+    jq \
     vainfo \
     mesa-va-drivers \
     intel-media-va-driver-non-free \

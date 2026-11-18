@@ -20,6 +20,8 @@ type TusUpload = {
   id?: string;
   ID?: string;
   size?: number;
+  is_partial?: boolean;
+  IsPartial?: boolean;
   meta_data?: Record<string, string>;
   metadata?: Record<string, string>;
   MetaData?: Record<string, string>;
@@ -40,7 +42,18 @@ export type TusIntakePlan = {
 const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SLUG_SAFE_STEM = /^[a-z0-9-]{1,200}$/;
 
-function watcherPreservesStem(stem: string, env: NodeJS.ProcessEnv): boolean {
+/** Mirror of the watcher's slug chain (sanitizeVideoId, minus 'video' fallback). */
+function slugifyStem(stem: string): string {
+  return stem
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '')
+    .replace(/-{2,}/g, '-');
+}
+
+/** Exported for ingestSource: a videoId the watcher would rename can't anchor delivery. */
+export function watcherPreservesStem(stem: string, env: NodeJS.ProcessEnv): boolean {
   const strategy = (env.VIDEO_ID_STRATEGY || 'random').trim();
   if (strategy !== 'filename') {
     // random strategy renames everything EXCEPT UUID stems, which are used
@@ -51,10 +64,15 @@ function watcherPreservesStem(stem: string, env: NodeJS.ProcessEnv): boolean {
   // base64url re-encodes every stem; none passes any stem through verbatim.
   if (mode === 'base64url') return false;
   if (mode === 'none') {
-    // Verbatim pass-through — still must be a single safe filename.
-    return stem === path.basename(stem) && stem !== '..' && stem.length <= 200;
+    // Verbatim pass-through — still must be a single safe filename, and '.'
+    // must not slip through the basename check into a hidden '..mp4'.
+    return stem === path.basename(stem) && stem !== '.' && stem !== '..' && stem.length <= 200;
   }
-  // slug and slug-hash keep already-slug-safe stems unchanged (UUIDs included).
+  if (mode === 'slug') {
+    // slug mode rewrites every stem — kept only when the stem IS its slug.
+    return slugifyStem(stem) === stem;
+  }
+  // slug-hash keeps /^[a-z0-9-]+$/ stems verbatim (hash only on rewrite).
   return SLUG_SAFE_STEM.test(stem);
 }
 const VIDEO_EXT = /\.(mp4|mkv|mov)$/i;
@@ -83,6 +101,9 @@ export function planTusIntake(
   const eventType = payload?.type ?? payload?.Type;
   if (eventType !== 'post-finish') return null;
   const upload = payload.event?.upload ?? payload.Event?.Upload;
+  // Concatenation partials also emit post-finish — the final assembled upload
+  // gets its own hook; publishing a partial would ship a segment, not a video.
+  if (upload?.is_partial === true || upload?.IsPartial === true) return null;
   const storage = upload?.storage ?? upload?.Storage;
   const storagePath = (storage?.path ?? storage?.Path ?? '').trim();
   const uploadId = upload?.id ?? upload?.ID;
@@ -119,6 +140,9 @@ export function planTusIntake(
   let destBasename: string;
   if (videoIdHint) {
     destBasename = `${videoIdHint}${ext}`;
+    if (Buffer.byteLength(destBasename, 'utf8') > 255) {
+      throw new Error(`tus hook: videoId hint too long for a filename`);
+    }
   } else {
     const suffix = `-${safeBasename(uploadId)}${ext}`;
     const stem = (safeBasename(originalName.replace(/\.[^.]+$/, '')) || 'upload').slice(

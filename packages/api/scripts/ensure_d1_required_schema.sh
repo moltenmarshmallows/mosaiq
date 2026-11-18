@@ -92,4 +92,31 @@ npx wrangler d1 execute "$DB_NAME" "$MODE_FLAG" --file=./scripts/ensure_d1_step1
 echo "[ensure-d1] ensuring Club entitlement tables/indexes (IRL + playback sessions)"
 npx wrangler d1 execute "$DB_NAME" "$MODE_FLAG" --file=./scripts/ensure_d1_club_entitlements.sql
 
+# Wrangler history — when d1_migrations exists (someone ran `migrations apply`
+# before), stamp the media-pipeline migrations this script covers so a later
+# apply does not re-run their unguarded ALTERs. Skip silently on DBs that
+# never initialized Wrangler history.
+table_exists() {
+  local table="$1"
+  local n
+  n="$(run_scalar "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = '$table';")"
+  [[ "$n" == "1" ]]
+}
+migration_stamp() {
+  local name="$1"
+  table_exists d1_migrations || return 0
+  local n
+  n="$(run_scalar "SELECT COUNT(*) AS n FROM d1_migrations WHERE name = '$name';")"
+  [[ "$n" == "0" ]] || return 0
+  echo "[ensure-d1] stamping migration history: $name"
+  npx wrangler d1 execute "$DB_NAME" "$MODE_FLAG" --command \
+    "INSERT INTO d1_migrations (name) VALUES ('$name');"
+}
+if column_exists videos raw_source_key; then
+  migration_stamp "0069_video_raw_source_key.sql"
+fi
+if column_exists videos pipeline_mode; then
+  migration_stamp "0070_video_pipeline_mode.sql"
+fi
+
 echo "[ensure-d1] done"

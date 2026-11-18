@@ -219,9 +219,22 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
       await storage.completeMultipartUpload(key, body.uploadId, parts);
     } catch (err) {
       // Retry after a committed upload → NoSuchUpload. Re-check the object and
-      // continue if B2 already committed it.
+      // continue if B2 already committed it; an expired session with no object
+      // is a clean 'start over' signal, not a 500.
       head = await storage.headObject(key);
-      if (!head?.size) throw err;
+      if (!head?.size) {
+        const name = (err as { name?: string })?.name ?? '';
+        const status =
+          (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
+        if (name === 'NoSuchUpload' || status === 404) {
+          return jsonResponse(
+            { error: 'Upload session expired; start a new upload', code: 'not_found' },
+            404,
+            corsHeaders,
+          );
+        }
+        throw err;
+      }
     }
     head = head ?? (await storage.headObject(key));
   }
@@ -247,7 +260,19 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
     .run();
 
   const ingest = await deliverIngestWebhook(request, env, videoId, key, pipelineMode);
-  return jsonResponse({ ok: ingest.delivered, videoId, bytes: head.size, ingest }, 200, corsHeaders);
+  // A committed source with a failed pipeline handoff is a real failure the
+  // client must surface (retry banner), not an ok:false/200 ambiguity.
+  return jsonResponse(
+    {
+      ok: ingest.delivered,
+      videoId,
+      bytes: head.size,
+      ingest,
+      ...(ingest.delivered ? {} : { error: 'Ingest delivery failed', code: ingest.code ?? 'ingest_failed' }),
+    },
+    ingest.delivered ? 200 : 502,
+    corsHeaders,
+  );
 }
 
 /** POST …/ingest — re-notify the pipeline for an already-committed source. */
@@ -330,13 +355,31 @@ export async function handleAdminUploadAbort(request: Request, env: any, corsHea
   try {
     await storage.abortMultipartUpload(video.raw_source_key, body.uploadId);
   } catch (err) {
-    // Provider says the session is already gone — that IS a cancelled upload.
     const name = (err as { name?: string })?.name ?? '';
     const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
     if (name !== 'NoSuchUpload' && status !== 404) {
       return jsonResponse(
         { error: 'Abort failed in storage; session kept for retry', code: 'abort_failed' },
         502,
+        corsHeaders,
+      );
+    }
+    // Session gone can also mean a raced /complete committed the object
+    // between our first HEAD and this abort — only detach the key when the
+    // object is confirmed absent, else we'd orphan the playable source.
+    try {
+      const after = await storage.headObject(video.raw_source_key);
+      if (after?.size) {
+        return jsonResponse(
+          { error: 'Upload already completed; abort would orphan the playable source', code: 'already_completed' },
+          409,
+          corsHeaders,
+        );
+      }
+    } catch {
+      return jsonResponse(
+        { error: 'Could not confirm upload state; retry', code: 'head_failed' },
+        503,
         corsHeaders,
       );
     }

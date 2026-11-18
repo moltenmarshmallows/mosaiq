@@ -43,16 +43,23 @@ export function useAdminVideoUpload(
   const sessionKey = (file: File) =>
     `${LS_PREFIX}${apiUrl}:${file.name}:${file.size}:${file.lastModified}`;
 
-  /** Cheap content check: hash head+tail so a same-named different file can't resume. */
+  /** Full-file content check: hash-of-hashes over 8MB chunks so a same-named
+   *  different file can never resume into the wrong session. */
   const fingerprint = async (file: File): Promise<string> => {
     try {
-      const head = await file.slice(0, 65536).arrayBuffer();
-      const tail = file.size > 65536 ? await file.slice(-65536).arrayBuffer() : new ArrayBuffer(0);
+      const chunkSize = 8 * 1024 * 1024;
+      const hashes: Uint8Array[] = [];
+      for (let off = 0; off < Math.max(1, file.size); off += chunkSize) {
+        const h = await crypto.subtle.digest(
+          'SHA-256',
+          await file.slice(off, off + chunkSize).arrayBuffer(),
+        );
+        hashes.push(new Uint8Array(h));
+      }
       const sizeBytes = new TextEncoder().encode(String(file.size));
-      const buf = new Uint8Array(head.byteLength + tail.byteLength + sizeBytes.byteLength);
-      buf.set(new Uint8Array(head), 0);
-      buf.set(new Uint8Array(tail), head.byteLength);
-      buf.set(sizeBytes, head.byteLength + tail.byteLength);
+      const buf = new Uint8Array(hashes.length * 32 + sizeBytes.byteLength);
+      hashes.forEach((h, i) => buf.set(h, i * 32));
+      buf.set(sizeBytes, hashes.length * 32);
       const digest = await crypto.subtle.digest('SHA-256', buf);
       return Array.from(new Uint8Array(digest).subarray(0, 8), (b) =>
         b.toString(16).padStart(2, '0'),
@@ -166,6 +173,9 @@ export function useAdminVideoUpload(
         saveSession(file, session);
       }
       const s = session;
+      // Server killed the session (404/expire): flag it so in-flight part
+      // successes from other pool workers don't resurrect localStorage.
+      let sessionInvalid = false;
       progress.value = { ...progress.value, state: 'uploading', videoId: s.videoId };
 
       const partCount = Math.max(1, Math.ceil(file.size / s.partSize));
@@ -178,6 +188,7 @@ export function useAdminVideoUpload(
         ) + [...inFlight.values()].reduce((a, b) => a + b, 0);
 
       const uploadPart = async (partNumber: number) => {
+        if (sessionInvalid) throw new Error('upload session invalidated');
         const blob = file.slice((partNumber - 1) * s.partSize, partNumber * s.partSize);
         for (let attempt = 0; ; attempt++) {
           inFlight.set(partNumber, 0);
@@ -190,9 +201,11 @@ export function useAdminVideoUpload(
               progress.value = { ...progress.value, bytesSent: sent() };
             });
             inFlight.delete(partNumber);
-            s.parts.push({ partNumber, etag });
-            s.parts.sort((a, b) => a.partNumber - b.partNumber);
-            saveSession(file, s);
+            if (!sessionInvalid) {
+              s.parts.push({ partNumber, etag });
+              s.parts.sort((a, b) => a.partNumber - b.partNumber);
+              saveSession(file, s);
+            }
             progress.value = { ...progress.value, bytesSent: sent() };
             return;
           } catch (err) {
@@ -201,9 +214,13 @@ export function useAdminVideoUpload(
             // the next upload() starts a fresh session instead of retrying 404s.
             const e = err as Error & { status?: number; code?: string };
             if (e.status === 404 || e.code === 'not_found') {
+              sessionInvalid = true;
               clearSession(file);
               throw err;
             }
+            // Other 4xx are definitive rejections (bad part, auth) — retrying
+            // burns attempts for nothing; 5xx/network stays retryable.
+            if (e.status !== undefined && e.status >= 400 && e.status < 500) throw err;
             if (attempt >= MAX_PART_RETRIES) throw err;
             await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
           }
@@ -228,7 +245,9 @@ export function useAdminVideoUpload(
           method: 'POST',
           body: JSON.stringify({
             uploadId: s.uploadId,
-            pipelineMode: opts.pipelineMode ?? 'fast_lane',
+            // Omit mode when unset — the server keeps the one stored at
+            // creation; hardcoding a default would downgrade a resumed session.
+            ...(opts.pipelineMode ? { pipelineMode: opts.pipelineMode } : {}),
             parts: s.parts,
           }),
         });

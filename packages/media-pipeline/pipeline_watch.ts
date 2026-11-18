@@ -3,7 +3,7 @@ import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { checkEncoreHealth } from './encoreClient.js';
@@ -165,13 +165,24 @@ async function waitWhilePaused(videoId: string): Promise<void> {
   }
 }
 
+/** rm -rf a job's tmp dir — never the base itself or anything outside it. */
+async function rmTmpJobDir(tmpDir: string): Promise<void> {
+  const base = path.resolve(TMP_DIR_BASE);
+  const target = path.resolve(tmpDir);
+  if (target === base || !target.startsWith(`${base}${path.sep}`)) {
+    log(`refusing to remove non-job directory '${target}' (TMP_DIR_BASE=${base})`);
+    return;
+  }
+  await rm(tmpDir, { recursive: true, force: true });
+}
+
 async function cleanupJobArtifacts(
   videoId: string,
   lockFile?: string,
   inputPath?: string,
 ): Promise<void> {
   const tmpDir = path.join(TMP_DIR_BASE, videoId);
-  await rm(tmpDir, { recursive: true, force: true });
+  await rmTmpJobDir(tmpDir);
 
   const inboxPath = inputPath;
   if (inboxPath) {
@@ -547,7 +558,7 @@ async function completePipelineSuccess(
   await writeFile(doneFlag, 'done');
   await rm(inputPath, { force: true });
   jobInputPaths.delete(videoId);
-  await rm(tmpDir, { recursive: true, force: true });
+  await rmTmpJobDir(tmpDir);
   emitPipelineEvent(videoId, 'done', 'success', 'watchfolder_and_tmp_cleared');
   emitProgressCheckpoint(videoId, 'done', PROGRESS.DONE, 'complete');
   await emitTtp(videoId, 'pipeline_done', {});
@@ -780,14 +791,25 @@ function scheduleInboxIntake(
     running ??
     (async () => {
       if (awaitStable) await waitStableSize(path.join(inboxDir, file));
-      inboxIntakeChain = inboxIntakeChain.then(() =>
+      const run = inboxIntakeChain.then(() =>
         intakeInboxBasename(file, inboxDir, pipelineMode, mechanism),
       );
-      await inboxIntakeChain;
+      // The caller keeps `run` (and its rejection); the shared tail recovers
+      // so one failed rename doesn't poison every later intake.
+      inboxIntakeChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      await run;
     })();
   if (!running) {
     inflightIntake.set(cacheKey, task);
-    void task.finally(() => inflightIntake.delete(cacheKey));
+    // Cleanup via handlers on `task` itself — a discarded .finally() would
+    // re-raise the rejection as an unhandled promise.
+    void task.then(
+      () => inflightIntake.delete(cacheKey),
+      () => inflightIntake.delete(cacheKey),
+    );
     void task.catch((err) => {
       log(
         `inbox intake failed for '${file}' (${inboxDir}): ${err instanceof Error ? err.message : String(err)}`,
@@ -877,7 +899,7 @@ type IpcCommand = {
   payload?: { order?: string[]; file?: string; inboxDir?: string; pipelineMode?: string };
 };
 
-function handleIpcCommand(raw: string): { ok: boolean; error?: string } {
+async function handleIpcCommand(raw: string): Promise<{ ok: boolean; error?: string }> {
   let parsed: IpcCommand;
   try {
     parsed = JSON.parse(raw) as IpcCommand;
@@ -920,8 +942,15 @@ function handleIpcCommand(raw: string): { ok: boolean; error?: string } {
     if (!watch || !isInboxVideoBasename(file) || /[\\/]/.test(file)) {
       return { ok: false, error: 'invalid_intake' };
     }
-    void scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'supervisor_publish');
-    return { ok: true };
+    // Acknowledge only once intake actually accepted — a transient rename
+    // failure must read as not-ok so the supervisor retries the handoff.
+    const accepted = await scheduleInboxIntake(
+      file,
+      watch.dir,
+      watch.pipelineMode,
+      'supervisor_publish',
+    );
+    return { ok: accepted, error: accepted ? undefined : 'intake_failed' };
   }
   return { ok: false, error: 'unknown_cmd' };
 }
@@ -936,8 +965,19 @@ async function startIpcServer(): Promise<void> {
       buf += chunk.toString();
     });
     socket.on('end', () => {
-      const response = JSON.stringify(handleIpcCommand(buf.trim()));
-      socket.end(response);
+      void (async () => {
+        try {
+          const response = JSON.stringify(await handleIpcCommand(buf.trim()));
+          socket.end(response);
+        } catch (err) {
+          socket.end(
+            JSON.stringify({
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
+        }
+      })();
     });
     socket.on('error', () => {
       try {
@@ -1193,11 +1233,22 @@ function startPollingWatcher() {
 }
 
 async function main() {
-  // Both lanes sharing one inbox would misroute every publication: the IPC
-  // lookup and the startup scan pick the first matching watch (fast-lane).
-  if (path.resolve(INBOX_FAST_LANE_DIR) === path.resolve(INBOX_FULL_LADDER_DIR)) {
+  // Create inboxes before inotify spawns — a fresh mount would otherwise kill
+  // inotifywait (and the pipeline) on the missing dir, and the lane check
+  // below needs real paths to compare.
+  for (const watch of INBOX_WATCHES) {
+    await mkdir(watch.dir, { recursive: true });
+  }
+  // Both lanes sharing one physical inbox would misroute every publication:
+  // the IPC lookup and the startup scan pick the first matching watch. Compare
+  // resolved real paths — a symlink alias passes a lexical path.resolve check.
+  const [fastReal, fullReal] = await Promise.all([
+    realpath(INBOX_FAST_LANE_DIR),
+    realpath(INBOX_FULL_LADDER_DIR),
+  ]);
+  if (fastReal === fullReal) {
     log(
-      `INBOX_FAST_LANE_DIR and INBOX_FULL_LADDER_DIR resolve to the same directory (${INBOX_FAST_LANE_DIR}) — refusing to start`,
+      `INBOX_FAST_LANE_DIR and INBOX_FULL_LADDER_DIR resolve to the same directory (${fastReal}) — refusing to start`,
     );
     process.exit(1);
   }
