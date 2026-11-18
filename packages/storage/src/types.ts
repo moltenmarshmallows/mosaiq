@@ -60,6 +60,20 @@ export interface ObjectStorageProvider {
   deleteObjects?(keys: string[]): Promise<void>;
   getSignedReadUrl(key: string, opts?: { expiresInSeconds?: number }): Promise<string>;
   getSignedWriteUrl(key: string, opts?: { expiresInSeconds?: number }): Promise<string>;
+  /** S3 multipart for browser-direct uploads (B2/S3 providers only). */
+  createMultipartUpload?(key: string): Promise<string>;
+  getSignedUploadPartUrl?(
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    opts?: { expiresInSeconds?: number },
+  ): Promise<string>;
+  completeMultipartUpload?(
+    key: string,
+    uploadId: string,
+    parts: { partNumber: number; etag: string }[],
+  ): Promise<void>;
+  abortMultipartUpload?(key: string, uploadId: string): Promise<void>;
   ping?(): Promise<{ ok: boolean; latencyMs: number; error?: string }>;
 }
 

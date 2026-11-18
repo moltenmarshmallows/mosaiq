@@ -7,8 +7,8 @@
  */
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import * as Sentry from '@sentry/cloudflare';
 import type { CloudflareOptions } from '@sentry/cloudflare';
+import * as Sentry from '@sentry/cloudflare';
 import {
   canonicalWatchToken,
   compareVideosNewestFirst,
@@ -45,6 +45,12 @@ import {
 import { ensureAdminSettingsTable } from './adminSettingsTable.js';
 import { handleAdminSystemFeatures } from './adminSystemFeatures.js';
 import {
+  handleAdminUploadAbort,
+  handleAdminUploadComplete,
+  handleAdminUploadCreate,
+  handleAdminUploadPartSign,
+} from './adminUploads.js';
+import {
   handleAcknowledgeInsecureNativeScheme,
   handleGetMe,
   handleInsecureNativeSchemeStatus,
@@ -65,6 +71,7 @@ import {
   resolveAuthSubFromRequest,
 } from './auth.js';
 import { B2PrimaryHealthDOBase } from './b2PrimaryHealth.js';
+import { isBillingProxyPath, proxyToBilling } from './billingProxy.js';
 import {
   handleAdminNewsletterCampaigns,
   handleAdminNewsletterDrafts,
@@ -111,7 +118,6 @@ import {
   handleListAccountIrlEvents,
 } from './irlEvents.js';
 import { isPrivateHost } from './is-private-host.js';
-import { isBillingProxyPath, proxyToBilling } from './billingProxy.js';
 import { normalizeLivestreamStatus } from './livestreams.js';
 import { log, runWithDatadogLogContext, setWorkerLogTracingContext } from './logger.js';
 import {
@@ -122,12 +128,6 @@ import {
   sortMasterPlaylistByBandwidth,
 } from './mediaEntrypoints.js';
 import { resolveMetricHttpRoute } from './metricHttpRoutes.js';
-import {
-  buildPublicAssetUrl,
-  handlePublicAsset,
-  rewriteStoredPublicObjectUrl,
-  withRewrittenThumbnailUrl,
-} from './publicAssets.js';
 import {
   handleDevicePairingComplete,
   handleDevicePairingPoll,
@@ -175,6 +175,12 @@ import {
 } from './posthog.js';
 import { recordHttpServerRequestMetric } from './posthogMetrics.js';
 import {
+  buildPublicAssetUrl,
+  handlePublicAsset,
+  rewriteStoredPublicObjectUrl,
+  withRewrittenThumbnailUrl,
+} from './publicAssets.js';
+import {
   createPushCampaignAndDeliveries,
   enqueueOverduePushDeliveries,
   ensurePushTierDefaultSettings,
@@ -205,11 +211,7 @@ import {
   handleReplicationQueue,
 } from './replication.js';
 import { isLocalVideoProxyUrl } from './requestPublicOrigin.js';
-import {
-  isAdministrativeRole,
-  isContentEditorRole,
-  mayAccessNonPublicVideo,
-} from './roles.js';
+import { isAdministrativeRole, isContentEditorRole, mayAccessNonPublicVideo } from './roles.js';
 import { maybeBlockDeploymentFeatureRoute } from './routeFeatureGuard.js';
 import { handleGetAccountRss, handleRotateAccountRss } from './rssAccount.js';
 import {
@@ -548,11 +550,7 @@ const workerHandler = {
               });
             }
 
-            const featureBlock = await maybeBlockDeploymentFeatureRoute(
-              request,
-              env,
-              corsHeaders,
-            );
+            const featureBlock = await maybeBlockDeploymentFeatureRoute(request, env, corsHeaders);
             if (featureBlock) return featureBlock;
 
             // Billing Worker owns payment HTTP (service binding).
@@ -718,6 +716,27 @@ const workerHandler = {
               request.method === 'PATCH'
             ) {
               return handleAdminLivestreamUpdate(request, env, corsHeaders);
+            }
+            if (url.pathname === '/api/admin/videos/uploads' && request.method === 'POST') {
+              return handleAdminUploadCreate(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/part$/) &&
+              request.method === 'GET'
+            ) {
+              return handleAdminUploadPartSign(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/complete$/) &&
+              request.method === 'POST'
+            ) {
+              return handleAdminUploadComplete(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/abort$/) &&
+              request.method === 'POST'
+            ) {
+              return handleAdminUploadAbort(request, env, corsHeaders);
             }
             if (url.pathname.startsWith('/api/admin/videos/') && request.method === 'PATCH') {
               return handleAdminVideoUpdate(request, env, ctx, corsHeaders);
@@ -1875,6 +1894,21 @@ async function handleVideoAccess(
       }
     }
 
+    // Progressive raw source (Bunny-style "play the original while encoding"):
+    // when no HLS manifest exists yet but an uploaded source file does, serve it
+    // as a progressive MP4 through the same proxy. Signed with previewUntil=null —
+    // a progressive file can't be time-truncated server-side; the client-side
+    // frame-accurate paywall handles preview gating.
+    let progressiveUrl: string | null = null;
+    const rawSourceKey =
+      typeof video?.raw_source_key === 'string' && video.raw_source_key.trim()
+        ? video.raw_source_key.trim()
+        : null;
+    if (!playlistUrl && rawSourceKey && allowAnonymousPlayable && env.JWT_SECRET) {
+      const vt = await signVideoToken(effectiveUserId, playbackVideoId, env.JWT_SECRET, null);
+      progressiveUrl = `/api/video-proxy/${rawSourceKey}?vt=${encodeURIComponent(vt)}`;
+    }
+
     const playableMoqEndpoint = allowAnonymousPlayable ? livestreamMoqEndpoint : null;
     const playableMoqBroadcast = allowAnonymousPlayable ? livestreamMoqBroadcast : null;
 
@@ -1893,6 +1927,8 @@ async function handleVideoAccess(
         fullDuration,
         previewDuration,
         playlistUrl,
+        progressiveUrl,
+        processing: Boolean(video && video.status && video.status !== 'processed'),
         publishStatus: video?.publish_status ?? null,
         staffPreview: Boolean(video && video.publish_status !== 'published' && canStaffPreview),
         mediaFound,

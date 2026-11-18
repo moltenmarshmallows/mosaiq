@@ -46,6 +46,20 @@ The pipeline asks the worker registry (`workerRegistry.ts`, Redis-backed heartbe
 
 - **Watchfolders** — `INBOX_FAST_LANE_DIR` → fast-lane (720p preview first, then ladder), `INBOX_FULL_LADDER_DIR` → ladder only.
 - **TUS resumable uploads** — `tusd` accepts uploads; the supervisor proxies `/vmp/uploads` (dashboard-secret auth) and `tusd`'s post-finish hook moves completed files into the same inboxes. `meta_data.pipelineMode=full_ladder|fast_lane`, optional `meta_data.videoId`. Clients upload with any tus client to `POST {supervisor}/vmp/uploads` + Bearer dashboard secret.
+- **Remote uploads (B2 hop)** — admins upload browser-direct to B2 at `videos/{id}/source.{ext}` via `@vmp/api` multipart presigning (`POST /api/admin/videos/uploads…`). On completion the API calls `POST /vmp/api/ingest` (HMAC, `VMP_WEBHOOK_SECRET`); the supervisor fetches the file **through the API's `/api/video-proxy`** — B2→Cloudflare egress is free, so testing costs nothing — and drops it into the inbox like a NAS drop. The raw MP4 is playable via the same proxy while HLS encodes; the `fully_processed` callback deletes it.
+
+### B2 bucket setup (one-time, `b2` CLI)
+
+Backblaze isn't in Terraform — configure the bucket once:
+
+```bash
+b2 bucket update "$B2_BUCKET_NAME" allPrivate \
+  --lifecycleRules '[{"fileNamePrefix":"","daysFromStartingToCancelingUnfinishedLargeFiles":7}]' \
+  --corsRules '[{"allowedOrigins":["https://staging.app.mosaiq.video","https://app.mosaiq.video"],"allowedOperations":["s3_put","s3_head","s3_get","s3_delete"],"allowedHeaders":["*"],"exposeHeaders":["ETag"],"maxAgeSeconds":3600}]'
+```
+
+- Lifecycle: abandons multipart uploads after 7 days (the only leak presigning can leave). Stray `source.*` objects can't be prefix-matched — the `fully_processed` callback deletes them; sweep `videos/*/source.*` manually if a video is deleted mid-encode.
+- CORS: **required** for the browser PUTs to B2's S3 endpoint and for reading the `ETag` back.
 
 ### Observability
 

@@ -5,6 +5,7 @@
 
 import type { D1Database } from '@cloudflare/workers-types';
 import { log } from './logger.js';
+import { getObjectStorage, type StorageEnv } from './objectStorage.js';
 import { clearPlaybackPositionsForVideo } from './playbackPositions.js';
 
 interface PipelineEnv {
@@ -141,12 +142,33 @@ export async function handleVideoPipelineStatus(
       return jsonResponse({ error: 'Video not found', code: 'not_found' }, 404, corsHeaders);
     }
 
+    const rawRow = (await db
+      .prepare('SELECT raw_source_key FROM videos WHERE id = ?')
+      .bind(videoId)
+      .first()) as { raw_source_key?: string | null } | null;
+
     await db
       .prepare(`
-      UPDATE videos SET status = 'processed', updated_at = CURRENT_TIMESTAMP WHERE id = ?
+      UPDATE videos SET status = 'processed', raw_source_key = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?
     `)
       .bind(videoId)
       .run();
+
+    // HLS is live — the progressive raw source is no longer needed.
+    if (stage === 'fully_processed' && rawRow?.raw_source_key) {
+      const storage = getObjectStorage(env as unknown as StorageEnv);
+      if (storage) {
+        await storage.deleteObject(rawRow.raw_source_key).catch((e) => {
+          log({
+            service: 'pipeline',
+            event: 'raw_source_cleanup_failed',
+            level: 'warn',
+            video_id: videoId,
+            detail: String(e),
+          });
+        });
+      }
+    }
 
     log({ service: 'pipeline', event: 'pipeline_status_updated', video_id: videoId, stage });
 

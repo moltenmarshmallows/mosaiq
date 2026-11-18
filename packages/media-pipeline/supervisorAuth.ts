@@ -32,6 +32,8 @@ export function isPipelineServicePath(pathname: string, method: string): boolean
   if (method === 'POST' && pathname === '/api/workers/heartbeat') return true;
   if (method === 'GET' && /^\/vmp\/api\/encoreJobAggregate\/[^/]+$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/vmp/api/tus-hook') return true;
+  // API-driven source ingest — HMAC-signed like the rebuild webhook.
+  if (method === 'POST' && pathname === '/vmp/api/ingest') return true;
   return false;
 }
 

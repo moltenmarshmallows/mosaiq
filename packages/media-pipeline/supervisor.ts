@@ -26,6 +26,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildAggregateEncoreJobDoc } from './encoreAggregate.js';
 import { getEncoreJob } from './encoreClient.js';
+import { IngestPlanError, planIngest } from './ingestSource.js';
 import { gauge, increment } from './metrics.js';
 import { rewriteEncoreJobUrlForPackager } from './packagerEncoreUrl.js';
 import { enqueuePackagerJob } from './packagingQueue.js';
@@ -52,6 +53,7 @@ import {
   redisHealthy,
   type WorkerGpuBackend,
 } from './workerRegistry.js';
+import { writeObjectBodyToFile } from './writeObjectBodyToFile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = __dirname;
@@ -84,6 +86,8 @@ const ENCORE_BASE = (process.env.ENCORE_BASE_URL || 'http://127.0.0.1:8080')
   .trim()
   .replace(/\/+$/, '');
 const TUSD_URL = (process.env.TUSD_URL || 'http://tusd:1080').trim().replace(/\/+$/, '');
+/** API origin ingest fetch URLs are allowed to point at (SSRF allowlist). */
+const apiBaseUrl = (process.env.VMP_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const WORKER_BACKENDS = new Set<WorkerGpuBackend>(['nvenc', 'vaapi', 'cpu']);
 
 const uiHost = process.env.VMP_UI_HOST || '127.0.0.1';
@@ -820,6 +824,22 @@ function verifySignature(rawBody, sigHeader, ts) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/** Shared HMAC+timestamp check for signed webhook POSTs; returns error text or null. */
+function verifySignedWebhookRequest(req: http.IncomingMessage, rawBody: Buffer): string | null {
+  if (!secret) return null;
+  const tsHeader = req.headers['x-vmp-timestamp'];
+  const ts = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
+  const tsNum = Number(ts);
+  if (!ts || !Number.isFinite(tsNum) || tsNum <= 0) return 'Invalid or stale timestamp';
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - tsNum) > 5 * 60) return 'Invalid or stale timestamp';
+  const sig = req.headers['x-vmp-signature'];
+  if (!verifySignature(rawBody, Array.isArray(sig) ? sig[0] : sig, ts)) {
+    return 'Invalid signature';
+  }
+  return null;
+}
+
 function timingSafeEqualString(provided: string, expected: string): boolean {
   const a = Buffer.from(provided, 'utf8');
   const b = Buffer.from(expected, 'utf8');
@@ -1269,32 +1289,10 @@ const server = http.createServer(async (req, res) => {
     }
     const rawBody = Buffer.concat(chunks);
 
-    if (secret) {
-      // Validate timestamp freshness
-      const tsHeader = req.headers['x-vmp-timestamp'];
-      const ts = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
-      if (!ts) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-      const tsNum = Number(ts);
-      if (!Number.isFinite(tsNum) || tsNum <= 0) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-      const nowSec = Math.floor(Date.now() / 1000);
-      const skewWindow = 5 * 60; // 5 minutes in seconds
-      if (Math.abs(nowSec - tsNum) > skewWindow) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-
-      // Verify signature
-      const sig = req.headers['x-vmp-signature'];
-      if (!verifySignature(rawBody, Array.isArray(sig) ? sig[0] : sig, ts)) {
-        json(res, { error: 'Invalid signature' }, 401);
-        return;
-      }
+    const webhookAuthError = verifySignedWebhookRequest(req, rawBody);
+    if (webhookAuthError) {
+      json(res, { error: webhookAuthError }, 401);
+      return;
     }
 
     let payload;
@@ -1696,6 +1694,73 @@ const server = http.createServer(async (req, res) => {
       json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
     } catch (err) {
       json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    return;
+  }
+
+  // ── API-driven ingest: pull a raw upload through the video proxy → inbox ──
+  if (req.method === 'POST' && url.pathname === '/vmp/api/ingest') {
+    const chunks: Buffer[] = [];
+    let byteCount = 0;
+    for await (const c of req) {
+      byteCount += c.length;
+      if (byteCount > MAX_BODY_SIZE) {
+        json(res, { error: 'Request body too large' }, 413);
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    }
+    const rawBody = Buffer.concat(chunks);
+    const authError = verifySignedWebhookRequest(req, rawBody);
+    if (authError) {
+      json(res, { error: authError }, 401);
+      return;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+      json(res, { error: 'Invalid JSON' }, 400);
+      return;
+    }
+    let plan;
+    try {
+      plan = planIngest(payload as Parameters<typeof planIngest>[0], apiBaseUrl);
+    } catch (err) {
+      json(
+        res,
+        {
+          error: err instanceof Error ? err.message : String(err),
+          code: err instanceof IngestPlanError ? err.code : 'invalid_request',
+        },
+        400,
+      );
+      return;
+    }
+    try {
+      const upstream = await fetch(plan.fetchUrl, { redirect: 'error' });
+      if (!upstream.ok || !upstream.body) {
+        json(
+          res,
+          { error: `source fetch failed: HTTP ${upstream.status}`, code: 'source_fetch_failed' },
+          502,
+        );
+        return;
+      }
+      await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
+      try {
+        await writeObjectBodyToFile(upstream.body, plan.destPath);
+      } catch (err) {
+        // Don't leave a partial source the watcher might pick up later.
+        await fs.promises.rm(plan.destPath, { force: true }).catch(() => {});
+        throw err;
+      }
+      increment('vmp.ingest.accepted', 1, { mode: plan.pipelineMode });
+      pushLog(`ingest → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
+      json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
+    } catch (err) {
+      json(res, { error: err instanceof Error ? err.message : String(err) }, 502);
     }
     return;
   }

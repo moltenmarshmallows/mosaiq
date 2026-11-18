@@ -314,13 +314,74 @@
         >
           <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
             <h2 class="text-xl font-bold text-gray-900 dark:text-white">Video management</h2>
-            <button
-              class="inline-flex items-center gap-2 px-3 py-2 rounded bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold"
-              @click="openLivestreamModal"
+            <div class="flex items-center gap-2">
+              <input
+                ref="videoUploadInput"
+                type="file"
+                accept="video/mp4,video/quicktime,.mp4,.mov,.mkv"
+                class="hidden"
+                @change="handleVideoUploadPick"
+              />
+              <button
+                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold disabled:opacity-50"
+                :disabled="videoUploadProgress.state === 'creating' || videoUploadProgress.state === 'uploading' || videoUploadProgress.state === 'completing'"
+                @click="videoUploadInput?.click()"
+              >
+                <span class="text-base leading-none">+</span>
+                Upload video
+              </button>
+              <button
+                class="inline-flex items-center gap-2 px-3 py-2 rounded bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold"
+                @click="openLivestreamModal"
+              >
+                <span class="text-base leading-none">+</span>
+                Create new livestream
+              </button>
+            </div>
+          </div>
+          <div
+            v-if="videoUploadProgress.state !== 'idle'"
+            class="mb-4 rounded-lg border p-3 text-sm"
+            :class="
+              videoUploadProgress.state === 'error'
+                ? 'border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300'
+                : videoUploadProgress.state === 'done'
+                  ? 'border-green-300 bg-green-50 text-green-800 dark:border-green-800 dark:bg-green-950/40 dark:text-green-300'
+                  : 'border-blue-300 bg-blue-50 text-blue-800 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-300'
+            "
+          >
+            <div class="flex items-center justify-between gap-3">
+              <span class="truncate">
+                {{ videoUploadFileName }} —
+                <template v-if="videoUploadProgress.state === 'creating'">starting upload…</template>
+                <template v-else-if="videoUploadProgress.state === 'uploading'">
+                  uploading {{ uploadPercent }}%
+                </template>
+                <template v-else-if="videoUploadProgress.state === 'completing'">
+                  finishing + queued for encoding…
+                </template>
+                <template v-else-if="videoUploadProgress.state === 'done'">
+                  uploaded — playable immediately, encoding in background
+                </template>
+                <template v-else>{{ videoUploadProgress.error }}</template>
+              </span>
+              <button
+                v-if="videoUploadProgress.state === 'error'"
+                class="shrink-0 underline"
+                @click="dismissVideoUpload"
+              >
+                dismiss
+              </button>
+            </div>
+            <div
+              v-if="videoUploadProgress.state === 'uploading'"
+              class="mt-2 h-1.5 w-full rounded bg-blue-200 dark:bg-blue-900"
             >
-              <span class="text-base leading-none">+</span>
-              Create new livestream
-            </button>
+              <div
+                class="h-1.5 rounded bg-blue-600 transition-all"
+                :style="{ width: `${uploadPercent}%` }"
+              />
+            </div>
           </div>
           <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
             Set preview lock per video: 0s means premium-only access, while matching full duration
@@ -4046,6 +4107,7 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     layoutIncludesFeaturedRowBlock,
   } from '~/composables/useHomepageLayout';
   import { adminTableThumbUrl, sizeUrl } from '~/composables/useThumbnail';
+  import { useAdminVideoUpload, type AdminUploadProgress } from '~/composables/useAdminVideoUpload';
   import { renderMarkdownToHtml } from '~/utils/markdown';
 
   // ── Route guard ───────────────────────────────────────────────────────────────
@@ -4253,6 +4315,27 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
   const trashing = ref<Record<string, boolean>>({});
   const uploadingFor = ref<string | null>(null);
   const thumbInputFocused = ref<string | null>(null);
+
+  // Raw file upload → B2 multipart → pipeline ingest (composable handles resume).
+  const videoUploadInput = ref<HTMLInputElement | null>(null);
+  const videoUploadProgress = ref<AdminUploadProgress>({
+    state: 'idle',
+    bytesSent: 0,
+    totalBytes: 0,
+    videoId: null,
+    error: null,
+  });
+  const videoUploadFileName = ref('');
+  const uploadPercent = computed(() =>
+    videoUploadProgress.value.totalBytes > 0
+      ? Math.min(
+          100,
+          Math.round(
+            (videoUploadProgress.value.bytesSent / videoUploadProgress.value.totalBytes) * 100,
+          ),
+        )
+      : 0,
+  );
   const activeAdminTab = ref<
     | 'videos'
     | 'categories'
@@ -5696,6 +5779,41 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     } finally {
       livestreamModal.value.saving = false;
     }
+  };
+
+  const videoUpload = useAdminVideoUpload(config.public.apiUrl, authHeader, videoUploadProgress);
+
+  const handleVideoUploadPick = async (event: Event) => {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    videoUploadFileName.value = file.name;
+    try {
+      const resumed = videoUpload.resume(file);
+      const result = await videoUpload.upload(file, { pipelineMode: 'fast_lane' });
+      showToast(
+        result?.ingestDelivered ? 'success' : 'error',
+        !result?.ingestDelivered
+          ? 'Upload finished, but the encoder could not be reached — the raw file is playable; retry encoding from the pipeline dashboard.'
+          : resumed
+            ? 'Upload resumed and finished — video is playable while it encodes.'
+            : 'Upload finished — video is playable while it encodes.',
+      );
+      await loadVideos();
+    } catch {
+      // Error text is already shown in the progress banner.
+    }
+  };
+
+  const dismissVideoUpload = () => {
+    videoUploadProgress.value = {
+      state: 'idle',
+      bytesSent: 0,
+      totalBytes: 0,
+      videoId: null,
+      error: null,
+    };
   };
 
   const loadVideos = async () => {
