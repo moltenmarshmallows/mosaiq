@@ -39,7 +39,8 @@ export function useAdminVideoUpload(
   authHeader: () => Record<string, string>,
   progress: Ref<AdminUploadProgress>,
 ) {
-  const sessionKey = (file: File) => `${LS_PREFIX}${file.name}:${file.size}`;
+  const sessionKey = (file: File) =>
+    `${LS_PREFIX}${file.name}:${file.size}:${file.lastModified}`;
 
   const loadSession = (file: File): Session | null => {
     try {
@@ -51,8 +52,13 @@ export function useAdminVideoUpload(
     }
   };
 
-  const saveSession = (file: File, s: Session) =>
-    localStorage.setItem(sessionKey(file), JSON.stringify(s));
+  const saveSession = (file: File, s: Session) => {
+    try {
+      localStorage.setItem(sessionKey(file), JSON.stringify(s));
+    } catch {
+      /* quota-full: resume just won't survive a reload */
+    }
+  };
   const clearSession = (file: File) => localStorage.removeItem(sessionKey(file));
 
   const apiFetch = async (path: string, init: RequestInit = {}) => {
@@ -72,7 +78,9 @@ export function useAdminVideoUpload(
     new Promise<string>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', url);
+      xhr.timeout = 10 * 60 * 1000; // a stalled part retries instead of hanging forever
       xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded);
+      xhr.ontimeout = () => reject(new Error('Part upload timed out'));
       xhr.onload = () => {
         const etag = xhr.getResponseHeader('ETag');
         if (xhr.status >= 200 && xhr.status < 300 && etag) resolve(etag.replace(/"/g, ''));
@@ -146,6 +154,12 @@ export function useAdminVideoUpload(
             return;
           } catch (err) {
             inFlight.delete(partNumber);
+            // Server-side session gone (aborted/expire) — drop local state so
+            // the next upload() starts a fresh session instead of retrying 404s.
+            if (err instanceof Error && /not found|404/i.test(err.message)) {
+              clearSession(file);
+              throw err;
+            }
             if (attempt >= MAX_PART_RETRIES) throw err;
             await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
           }
@@ -187,6 +201,11 @@ export function useAdminVideoUpload(
 
   const resume = (file: File) => loadSession(file) !== null;
 
+  /** Re-notify the encoder for an upload whose ingest webhook failed. */
+  const retryIngest = async (videoId: string) => {
+    await apiFetch(`/api/admin/videos/uploads/${videoId}/ingest`, { method: 'POST' });
+  };
+
   const abort = async (file: File) => {
     const s = loadSession(file);
     if (!s) return;
@@ -198,5 +217,5 @@ export function useAdminVideoUpload(
     progress.value = { state: 'idle', bytesSent: 0, totalBytes: 0, videoId: null, error: null };
   };
 
-  return { upload, resume, abort };
+  return { upload, resume, abort, retryIngest };
 }

@@ -1173,7 +1173,7 @@ function dashboardHtml() {
         const workerRows = (d.workers || []).map(w =>
           '<tr><td>' + escapeHtml(w.hostname || w.workerId || '') + '</td><td>' + escapeHtml(w.gpuBackend || '') +
           '</td><td>' + escapeHtml(String(w.pollQueue ?? '')) + '</td><td>' + escapeHtml(w.version || '—') +
-          '</td><td>' + escapeHtml(w.lastSeen || '') + '</td></tr>'
+          '</td><td>' + escapeHtml(w.lastSeenAt || '') + '</td></tr>'
         ).join('')
         document.getElementById('workers').innerHTML = workerRows
           ? '<table><thead><tr><th>Worker</th><th>Backend</th><th>Poll queue</th><th>Version</th><th>Last heartbeat</th></tr></thead><tbody>' + workerRows + '</tbody></table>'
@@ -1688,7 +1688,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
-      await fs.promises.rename(plan.srcPath, plan.destPath);
+      try {
+        // link() is atomic and never overwrites an already-accepted inbox file.
+        await fs.promises.link(plan.srcPath, plan.destPath);
+        await fs.promises.rm(plan.srcPath, { force: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+          throw new Error(`inbox file ${plan.destBasename} already exists — refusing to overwrite`);
+        }
+        throw err;
+      }
       increment('vmp.tus.upload.accepted', 1, { mode: plan.pipelineMode });
       pushLog(`tus upload → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
       json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
@@ -1700,16 +1709,29 @@ const server = http.createServer(async (req, res) => {
 
   // ── API-driven ingest: pull a raw upload through the video proxy → inbox ──
   if (req.method === 'POST' && url.pathname === '/vmp/api/ingest') {
+    // This route is exempt from dashboard auth; it must fail closed on HMAC
+    // even when VMP_REQUIRE_WEBHOOK_SECRET=0.
+    if (!secret) {
+      json(res, { error: 'Webhook secret not configured' }, 503);
+      return;
+    }
     const chunks: Buffer[] = [];
     let byteCount = 0;
-    for await (const c of req) {
-      byteCount += c.length;
-      if (byteCount > MAX_BODY_SIZE) {
-        json(res, { error: 'Request body too large' }, 413);
-        req.destroy();
-        return;
+    try {
+      for await (const c of req) {
+        byteCount += c.length;
+        if (byteCount > MAX_BODY_SIZE) {
+          json(res, { error: 'Request body too large' }, 413);
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
       }
-      chunks.push(c);
+    } catch {
+      if (!res.writableEnded && !res.destroyed) {
+        json(res, { error: 'Request body read failed' }, 400);
+      }
+      return;
     }
     const rawBody = Buffer.concat(chunks);
     const authError = verifySignedWebhookRequest(req, rawBody);
@@ -1748,12 +1770,25 @@ const server = http.createServer(async (req, res) => {
         );
         return;
       }
-      await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
+      // Stage outside the watched inbox (same /media filesystem), then publish
+      // via link() — atomic, and never clobbers a file the watcher accepted.
+      const stagingDir = path.join(
+        (process.env.TMP_DIR_BASE || '/mnt/tmp/video_pipeline').trim(),
+        '.ingest',
+      );
+      await fs.promises.mkdir(stagingDir, { recursive: true });
+      const staged = path.join(stagingDir, `${plan.destBasename}.${crypto.randomUUID()}`);
       try {
-        await writeObjectBodyToFile(upstream.body, plan.destPath);
+        await writeObjectBodyToFile(upstream.body, staged);
+        await fs.promises.mkdir(path.dirname(plan.destPath), { recursive: true });
+        try {
+          await fs.promises.link(staged, plan.destPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        }
+        await fs.promises.rm(staged, { force: true });
       } catch (err) {
-        // Don't leave a partial source the watcher might pick up later.
-        await fs.promises.rm(plan.destPath, { force: true }).catch(() => {});
+        await fs.promises.rm(staged, { force: true }).catch(() => {});
         throw err;
       }
       increment('vmp.ingest.accepted', 1, { mode: plan.pipelineMode });
@@ -1886,8 +1921,13 @@ async function buildMetricsText(): Promise<string> {
   for (const [backend, count] of byBackend) g('workers', count, `backend="${esc(backend)}"`);
   g('workers_total', workers.length);
 
+  const packagerStatusCounts = new Map<string, number>();
   for (const job of listPackagingJobs()) {
-    g('packaging_jobs', 1, `status="${esc(job.status)}"`);
+    const status = String(job.status || 'unknown');
+    packagerStatusCounts.set(status, (packagerStatusCounts.get(status) || 0) + 1);
+  }
+  for (const [status, count] of packagerStatusCounts) {
+    g('packaging_jobs', count, `status="${esc(status)}"`);
   }
 
   g('redis_up', (await redisHealthy()) ? 1 : 0);

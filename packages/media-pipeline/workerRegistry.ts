@@ -44,12 +44,17 @@ function createRegistryClient() {
 
 let redisClient: RegistryRedisClient | null = null;
 let redisConnectPromise: Promise<RegistryRedisClient | null> | null = null;
-let redisDisabled = false;
+// Retry a failed Redis connect after a cooldown instead of latching memory-only.
+let redisRetryAfterMs = 0;
+const REDIS_RETRY_COOLDOWN_MS = 30_000;
 
 const memoryWorkers = new Map<string, WorkerRecord & { expiresAtMs: number }>();
 
 async function getRedis(): Promise<RegistryRedisClient | null> {
-  if (redisDisabled || process.env.VMP_WORKER_REGISTRY_MEMORY_ONLY === '1') {
+  if (
+    Date.now() < redisRetryAfterMs ||
+    process.env.VMP_WORKER_REGISTRY_MEMORY_ONLY === '1'
+  ) {
     return null;
   }
   if (redisClient?.isOpen) return redisClient;
@@ -70,7 +75,7 @@ async function getRedis(): Promise<RegistryRedisClient | null> {
       process.stderr.write(
         `[worker-registry] redis unavailable, memory-only: ${err instanceof Error ? err.message : String(err)}\n`,
       );
-      redisDisabled = true;
+      redisRetryAfterMs = Date.now() + REDIS_RETRY_COOLDOWN_MS;
       return null;
     } finally {
       redisConnectPromise = null;
@@ -129,11 +134,13 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
   const client = await getRedis();
   if (client) {
     try {
-      for await (const key of client.scanIterator({ MATCH: `${REDIS_KEY_PREFIX}*`, COUNT: 100 })) {
-        const raw = await client.get(String(key));
-        if (!raw) continue;
-        const record = JSON.parse(String(raw)) as WorkerRecord;
-        if (record?.workerId) seen.set(record.workerId, record);
+      for await (const keys of client.scanIterator({ MATCH: `${REDIS_KEY_PREFIX}*`, COUNT: 100 })) {
+        for (const key of keys) {
+          const raw = await client.get(String(key));
+          if (!raw) continue;
+          const record = JSON.parse(String(raw)) as WorkerRecord;
+          if (record?.workerId) seen.set(record.workerId, record);
+        }
       }
     } catch {
       /* fall through to memory */
@@ -172,7 +179,7 @@ export async function liveWorkerBackends(): Promise<Set<WorkerGpuBackend>> {
 /** Test helper — reset in-memory + redis client state. */
 export async function _resetWorkerRegistryForTests(): Promise<void> {
   memoryWorkers.clear();
-  redisDisabled = false;
+  redisRetryAfterMs = 0;
   if (redisClient?.isOpen) {
     try {
       await redisClient.quit();

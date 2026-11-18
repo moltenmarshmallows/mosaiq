@@ -15,7 +15,7 @@ VAAPI_DEVICE="${VAAPI_DEVICE:-/dev/dri/renderD128}"
 probe() { # probe <label> <ffmpeg args...>
   label="$1"; shift
   if "$FFMPEG" -hide_banner -loglevel error "$@" -f null - 2>/dev/null; then
-    echo "$label"; return 0
+    echo "probe ok: $label" >&2; return 0
   fi
   return 1
 }

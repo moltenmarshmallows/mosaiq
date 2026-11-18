@@ -1,7 +1,7 @@
 /**
  * TUS upload intake — maps a tusd post-finish hook payload to a move into the
  * pipeline watchfolders. The watchfolder then assigns the video ID exactly as
- * it does for NAS-dropped files (or honors meta_data.videoId verbatim).
+ * it does for NAS-dropped files (or honors MetaData.videoId verbatim).
  */
 
 import fs from 'node:fs';
@@ -9,17 +9,22 @@ import path from 'node:path';
 import { resolveInboxDir } from './inboxDirs.js';
 import type { PipelineMode } from './pipelineMode.js';
 
+/** Native tusd hook payload (capitalized) plus a lowercase-tolerant view. */
 export type TusHookPayload = {
   type?: string;
-  event?: {
-    upload?: {
-      id?: string;
-      size?: number;
-      meta_data?: Record<string, string>;
-      metadata?: Record<string, string>;
-      storage?: { type?: string; path?: string };
-    };
-  };
+  Type?: string;
+  event?: { upload?: TusUpload };
+  Event?: { Upload?: TusUpload };
+};
+type TusUpload = {
+  id?: string;
+  ID?: string;
+  size?: number;
+  meta_data?: Record<string, string>;
+  metadata?: Record<string, string>;
+  MetaData?: Record<string, string>;
+  storage?: { type?: string; path?: string; Type?: string; Path?: string };
+  Storage?: { type?: string; path?: string; Type?: string; Path?: string };
 };
 
 export type TusIntakePlan = {
@@ -54,10 +59,14 @@ export function planTusIntake(
   payload: TusHookPayload,
   env: NodeJS.ProcessEnv = process.env,
 ): TusIntakePlan | null {
-  if (payload?.type !== 'post-finish') return null;
-  const upload = payload.event?.upload;
-  const storagePath = (upload?.storage?.path || '').trim();
-  if (!upload?.id || !storagePath || upload?.storage?.type !== 'filestore') {
+  const eventType = payload?.type ?? payload?.Type;
+  if (eventType !== 'post-finish') return null;
+  const upload = payload.event?.upload ?? payload.Event?.Upload;
+  const storage = upload?.storage ?? upload?.Storage;
+  const storagePath = (storage?.path ?? storage?.Path ?? '').trim();
+  const uploadId = upload?.id ?? upload?.ID;
+  const storageType = storage?.type ?? storage?.Type;
+  if (!uploadId || !storagePath || storageType !== 'filestore') {
     throw new Error('tus hook: missing upload id or filestore path');
   }
 
@@ -70,18 +79,21 @@ export function planTusIntake(
     throw new Error(`tus hook: upload file missing at ${resolved}`);
   }
 
-  const meta = upload.meta_data || upload.metadata || {};
-  const ext = path.extname(resolved) || path.extname(meta.filename || '') || '.mp4';
+  const meta = upload?.meta_data ?? upload?.metadata ?? upload?.MetaData ?? {};
+  const rawName = path.basename(meta.filename || '').replace(/\.[^.]+$/, '');
+  let ext = path.extname(resolved) || path.extname(rawName) || '.mp4';
   if (!VIDEO_EXT.test(ext)) {
     throw new Error(`tus hook: unsupported extension ${ext}`);
   }
+  ext = ext.toLowerCase();
 
   const pipelineMode: PipelineMode =
     meta.pipelineMode === 'full_ladder' ? 'full_ladder' : 'fast_lane';
   const videoIdHint = meta.videoId && SAFE_ID.test(meta.videoId) ? meta.videoId : undefined;
+  // No hint: name by the unique upload id so same-named files can't collide.
   const destBasename = videoIdHint
     ? `${videoIdHint}${ext}`
-    : `${safeBasename(meta.filename || upload.id)}`;
+    : `${safeBasename(rawName) || safeBasename(uploadId)}-${safeBasename(uploadId)}${ext}`;
   const destPath = path.join(resolveInboxDir(pipelineMode, env), destBasename);
   return { srcPath: resolved, destPath, destBasename, pipelineMode, videoIdHint };
 }

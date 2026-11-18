@@ -48,6 +48,7 @@ import {
   handleAdminUploadAbort,
   handleAdminUploadComplete,
   handleAdminUploadCreate,
+  handleAdminUploadIngest,
   handleAdminUploadPartSign,
 } from './adminUploads.js';
 import {
@@ -737,6 +738,12 @@ const workerHandler = {
               request.method === 'POST'
             ) {
               return handleAdminUploadAbort(request, env, corsHeaders);
+            }
+            if (
+              url.pathname.match(/^\/api\/admin\/videos\/uploads\/[^/]+\/ingest$/) &&
+              request.method === 'POST'
+            ) {
+              return handleAdminUploadIngest(request, env, corsHeaders);
             }
             if (url.pathname.startsWith('/api/admin/videos/') && request.method === 'PATCH') {
               return handleAdminVideoUpdate(request, env, ctx, corsHeaders);
@@ -1904,9 +1911,14 @@ async function handleVideoAccess(
       typeof video?.raw_source_key === 'string' && video.raw_source_key.trim()
         ? video.raw_source_key.trim()
         : null;
-    if (!playlistUrl && rawSourceKey && allowAnonymousPlayable && env.JWT_SECRET) {
+    // mediaFound=false means the entrypoint is a synthetic master.m3u8 that
+    // would 404 — prefer the real uploaded source whenever no media exists.
+    // Token is minted full-access for all viewers: a progressive MP4 can't be
+    // segment-truncated server-side; the client-side paywall gates preview.
+    if (rawSourceKey && (!playlistUrl || !mediaFound) && allowAnonymousPlayable && env.JWT_SECRET) {
       const vt = await signVideoToken(effectiveUserId, playbackVideoId, env.JWT_SECRET, null);
       progressiveUrl = `/api/video-proxy/${rawSourceKey}?vt=${encodeURIComponent(vt)}`;
+      if (!mediaFound) playlistUrl = null;
     }
 
     const playableMoqEndpoint = allowAnonymousPlayable ? livestreamMoqEndpoint : null;
@@ -1963,7 +1975,9 @@ async function handleVideoAccess(
       is_preview: !hasPremiumAccess,
       subscription_status: subscription?.status ?? 'none',
     });
-    return jsonResponse(response, 200, corsHeaders, anonSetCookie);
+    // Per-user playback URLs — never cacheable by a shared cache.
+    const accessHeaders = { ...corsHeaders, 'Cache-Control': 'private, no-store' };
+    return jsonResponse(response, 200, accessHeaders, anonSetCookie);
   } catch (error) {
     console.error('Error:', error);
     return jsonResponse(
@@ -2094,6 +2108,24 @@ async function handleVideoProxy(
         corsHeaders,
       );
     }
+  }
+
+  // Raw upload sources (videos/{id}/source.{ext}) are the whole original file —
+  // a preview-limited token must never unlock them. Progressive playback tokens
+  // for sources are minted with previewUntil=null by handleVideoAccess (the
+  // client-side paywall gates preview time on progressive MP4).
+  const isRawSource = /^videos\/[^/]+\/source\.(mp4|mov|mkv)$/i.test(normalizedPath);
+  if (
+    isRawSource &&
+    tokenClaims &&
+    typeof tokenClaims.previewUntil === 'number' &&
+    tokenClaims.previewUntil >= 0
+  ) {
+    return jsonResponse(
+      { error: 'Video token does not grant access to the source file', code: 'source_forbidden' },
+      403,
+      corsHeaders,
+    );
   }
 
   // Enforce previewUntil from token claims

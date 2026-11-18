@@ -27,7 +27,7 @@ export interface GetObjectResult {
   body: ReadableStream | Uint8Array | ArrayBuffer;
   contentType?: string;
   size?: number;
-  range?: { offset: number; length: number };
+  range?: { offset: number; length: number; total?: number };
 }
 
 export interface ListObjectsPageOptions {

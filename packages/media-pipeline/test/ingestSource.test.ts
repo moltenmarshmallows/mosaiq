@@ -84,7 +84,10 @@ test('rejects non-video extensions', () => {
 });
 
 test('rejects unsafe videoIds and wrong events', () => {
-  assert.throws(() => planIngest({ ...valid, videoId: '../etc' }, API, env), IngestPlanError);
+  assert.throws(
+    () => planIngest({ ...valid, videoId: '../etc' }, API, env),
+    (e: unknown) => e instanceof IngestPlanError && e.code === 'invalid_video_id',
+  );
   assert.throws(() => planIngest({ ...valid, event: 'other' }, API, env), IngestPlanError);
 });
 

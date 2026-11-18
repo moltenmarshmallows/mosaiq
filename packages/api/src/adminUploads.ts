@@ -40,6 +40,15 @@ function getDb(env: any) {
   return db;
 }
 
+async function requireEditor(request: Request, env: any, corsHeaders: any) {
+  try {
+    await requireRole(request, env, 'editor', 'admin', 'super_admin');
+  } catch {
+    return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+  }
+  return null;
+}
+
 type MultipartStorage = ObjectStorageProvider &
   Required<
     Pick<
@@ -75,7 +84,8 @@ async function getVideoUploadState(env: any, videoId: string) {
 
 /** POST /api/admin/videos/uploads — create draft video + multipart session. */
 export async function handleAdminUploadCreate(request: Request, env: any, corsHeaders: any) {
-  await requireRole(request, env, 'editor', 'admin', 'super_admin');
+  const authError = await requireEditor(request, env, corsHeaders);
+  if (authError) return authError;
   const storage = storageOrNull(env);
   if (!storage) {
     return jsonResponse(
@@ -101,13 +111,19 @@ export async function handleAdminUploadCreate(request: Request, env: any, corsHe
     String(body?.title || '').trim() || filename.replace(RAW_EXT_RE, '').trim() || videoId;
 
   const uploadId = await storage.createMultipartUpload(key);
-  await getDb(env)
-    .prepare(
-      `INSERT INTO videos (id, title, description, full_duration, preview_duration, status, publish_status, slug, raw_source_key, upload_date, updated_at)
-       VALUES (?, ?, '', 0, 0, 'processing', 'draft', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-    )
-    .bind(videoId, title, `raw-${crypto.randomUUID().slice(0, 8)}`, key)
-    .run();
+  try {
+    await getDb(env)
+      .prepare(
+        `INSERT INTO videos (id, title, description, full_duration, preview_duration, status, publish_status, slug, raw_source_key, upload_date, updated_at)
+         VALUES (?, ?, '', 0, 0, 'processing', 'draft', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      )
+      .bind(videoId, title, `raw-${crypto.randomUUID().slice(0, 8)}`, key)
+      .run();
+  } catch (err) {
+    // Don't leak an untracked multipart session nobody can abort.
+    await storage.abortMultipartUpload(key, uploadId).catch(() => {});
+    throw err;
+  }
 
   return jsonResponse(
     { videoId, key, uploadId, partSize: PART_SIZE, pipelineMode },
@@ -118,7 +134,8 @@ export async function handleAdminUploadCreate(request: Request, env: any, corsHe
 
 /** GET …/part — presign one UploadPart PUT (B2 supports presigned parts). */
 export async function handleAdminUploadPartSign(request: Request, env: any, corsHeaders: any) {
-  await requireRole(request, env, 'editor', 'admin', 'super_admin');
+  const authError = await requireEditor(request, env, corsHeaders);
+  if (authError) return authError;
   const storage = storageOrNull(env);
   if (!storage?.getSignedUploadPartUrl) {
     return jsonResponse(
@@ -145,7 +162,8 @@ export async function handleAdminUploadPartSign(request: Request, env: any, cors
 
 /** POST …/complete — finish multipart, mark processing, notify pipeline. */
 export async function handleAdminUploadComplete(request: Request, env: any, corsHeaders: any) {
-  await requireRole(request, env, 'editor', 'admin', 'super_admin');
+  const authError = await requireEditor(request, env, corsHeaders);
+  if (authError) return authError;
   const storage = storageOrNull(env);
   if (!storage) {
     return jsonResponse(
@@ -175,8 +193,18 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
     return jsonResponse({ error: 'Upload session not found', code: 'not_found' }, 404, corsHeaders);
   }
 
-  await storage.completeMultipartUpload(key, body.uploadId, parts);
-  const head = await storage.headObject(key);
+  let head = await storage.headObject(key);
+  if (!head?.size) {
+    try {
+      await storage.completeMultipartUpload(key, body.uploadId, parts);
+    } catch (err) {
+      // Retry after a committed upload → NoSuchUpload. Re-check the object and
+      // continue if B2 already committed it.
+      head = await storage.headObject(key);
+      if (!head?.size) throw err;
+    }
+    head = head ?? (await storage.headObject(key));
+  }
   if (!head?.size) {
     return jsonResponse({ error: 'Uploaded object missing after complete' }, 502, corsHeaders);
   }
@@ -188,23 +216,64 @@ export async function handleAdminUploadComplete(request: Request, env: any, cors
     .run();
 
   const ingest = await deliverIngestWebhook(request, env, videoId, key, pipelineMode);
-  return jsonResponse({ ok: true, videoId, bytes: head.size, ingest }, 200, corsHeaders);
+  return jsonResponse({ ok: ingest.delivered, videoId, bytes: head.size, ingest }, 200, corsHeaders);
+}
+
+/** POST …/ingest — re-notify the pipeline for an already-committed source. */
+export async function handleAdminUploadIngest(request: Request, env: any, corsHeaders: any) {
+  const authError = await requireEditor(request, env, corsHeaders);
+  if (authError) return authError;
+  const videoId = new URL(request.url).pathname.split('/').at(-2) || '';
+  const video = await getVideoUploadState(env, videoId);
+  const key = video?.raw_source_key;
+  if (!key) {
+    return jsonResponse({ error: 'No raw source to ingest', code: 'not_found' }, 404, corsHeaders);
+  }
+  if (video?.status === 'processed') {
+    return jsonResponse({ error: 'Video already processed' }, 409, corsHeaders);
+  }
+  const body = (await request.json().catch(() => null)) as { pipelineMode?: string } | null;
+  const ingest = await deliverIngestWebhook(request, env, videoId, key, body?.pipelineMode || 'fast_lane');
+  return jsonResponse(
+    { ok: ingest.delivered, ingest },
+    ingest.delivered ? 200 : 502,
+    corsHeaders,
+  );
 }
 
 /** POST …/abort — cancel the multipart session and detach the raw key. */
 export async function handleAdminUploadAbort(request: Request, env: any, corsHeaders: any) {
-  await requireRole(request, env, 'editor', 'admin', 'super_admin');
+  const authError = await requireEditor(request, env, corsHeaders);
+  if (authError) return authError;
   const storage = storageOrNull(env);
   const videoId = new URL(request.url).pathname.split('/').at(-2) || '';
   const body = (await request.json().catch(() => null)) as { uploadId?: string } | null;
+  if (!body?.uploadId) {
+    return jsonResponse({ error: 'uploadId required' }, 400, corsHeaders);
+  }
   const video = await getVideoUploadState(env, videoId);
   if (!video?.raw_source_key) {
     return jsonResponse({ error: 'Upload session not found', code: 'not_found' }, 404, corsHeaders);
   }
-  if (storage?.abortMultipartUpload && body?.uploadId) {
-    await storage
-      .abortMultipartUpload(video.raw_source_key, body.uploadId)
-      .catch((e) => console.warn('abortMultipartUpload:', e));
+  // A completed upload is the playable source — refuse to detach it.
+  const head = await storage?.headObject(video.raw_source_key).catch(() => null);
+  if (head?.size) {
+    return jsonResponse(
+      { error: 'Upload already completed; abort would orphan the playable source', code: 'already_completed' },
+      409,
+      corsHeaders,
+    );
+  }
+  if (storage?.abortMultipartUpload) {
+    try {
+      await storage.abortMultipartUpload(video.raw_source_key, body.uploadId);
+    } catch {
+      return jsonResponse(
+        { error: 'Abort failed in storage; session kept for retry', code: 'abort_failed' },
+        502,
+        corsHeaders,
+      );
+    }
   }
   await getDb(env)
     .prepare(
@@ -246,8 +315,10 @@ async function deliverIngestWebhook(
   const vt = await signVideoToken('anonymous', videoId, jwtSecret, null, {
     ttlSeconds: INGEST_TOKEN_TTL_SECONDS,
   });
-  const apiOrigin = new URL(request.url).origin;
-  const sourceUrl = `${apiOrigin}/api/video-proxy/${key}?vt=${encodeURIComponent(vt)}`;
+  // The supervisor only accepts the origin it knows as VMP_API_BASE_URL — build
+  // the source URL from the same canonical value, not the request's hostname.
+  const apiOrigin = String(env.VMP_API_BASE_URL || '').trim() || new URL(request.url).origin;
+  const sourceUrl = `${apiOrigin.replace(/\/+$/, '')}/api/video-proxy/${key}?vt=${encodeURIComponent(vt)}`;
   const rawBody = JSON.stringify({
     event: 'ingest_source',
     videoId,

@@ -372,6 +372,14 @@
               >
                 dismiss
               </button>
+              <button
+                v-if="videoUploadProgress.state === 'done' && videoUploadIngestPending"
+                class="shrink-0 underline"
+                :disabled="videoUploadIngestRetrying"
+                @click="retryVideoIngest"
+              >
+                {{ videoUploadIngestRetrying ? 'retrying…' : 'retry encoder notification' }}
+              </button>
             </div>
             <div
               v-if="videoUploadProgress.state === 'uploading'"
@@ -4326,6 +4334,8 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     error: null,
   });
   const videoUploadFileName = ref('');
+  const videoUploadIngestPending = ref(false);
+  const videoUploadIngestRetrying = ref(false);
   const uploadPercent = computed(() =>
     videoUploadProgress.value.totalBytes > 0
       ? Math.min(
@@ -5792,6 +5802,7 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     try {
       const resumed = videoUpload.resume(file);
       const result = await videoUpload.upload(file, { pipelineMode: 'fast_lane' });
+      videoUploadIngestPending.value = result?.ingestDelivered === false;
       showToast(
         result?.ingestDelivered ? 'success' : 'error',
         !result?.ingestDelivered
@@ -5806,7 +5817,23 @@ Response 429: rate limit exceeded — retry after the Retry-After header value (
     }
   };
 
+  const retryVideoIngest = async () => {
+    const videoId = videoUploadProgress.value.videoId;
+    if (!videoId) return;
+    videoUploadIngestRetrying.value = true;
+    try {
+      await videoUpload.retryIngest(videoId);
+      videoUploadIngestPending.value = false;
+      showToast('success', 'Encoder notified — the video is queued for encoding.');
+    } catch {
+      showToast('error', 'Encoder still unreachable — try again later.');
+    } finally {
+      videoUploadIngestRetrying.value = false;
+    }
+  };
+
   const dismissVideoUpload = () => {
+    videoUploadIngestPending.value = false;
     videoUploadProgress.value = {
       state: 'idle',
       bytesSent: 0,

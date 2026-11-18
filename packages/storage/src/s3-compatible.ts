@@ -149,13 +149,13 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
       const stream = bodyToWebStream(out.Body);
       if (!stream) return null;
       const contentRange = out.ContentRange;
-      let parsedRange: { offset: number; length: number } | undefined;
+      let parsedRange: { offset: number; length: number; total?: number } | undefined;
       if (contentRange) {
         const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
         if (match) {
           const offset = Number.parseInt(match[1]!, 10);
           const end = Number.parseInt(match[2]!, 10);
-          parsedRange = { offset, length: end - offset + 1 };
+          parsedRange = { offset, length: end - offset + 1, total: Number.parseInt(match[3]!, 10) };
         }
       }
       return {

@@ -58,6 +58,11 @@ export function planIngest(
   } catch {
     throw new IngestPlanError('ingest_not_configured', 'VMP_API_BASE_URL is not a valid URL');
   }
+  // The source URL carries a signed vt credential — require TLS except loopback dev.
+  const loopback = /^(localhost|127\.0\.0\.1|\[::1\])$/i.test(allowed.hostname);
+  if (allowed.protocol !== 'https:' && !loopback) {
+    throw new IngestPlanError('ingest_not_configured', 'VMP_API_BASE_URL must be https');
+  }
 
   let source: URL;
   try {
@@ -65,8 +70,8 @@ export function planIngest(
   } catch {
     throw new IngestPlanError('invalid_source_url', 'sourceUrl is not a valid URL');
   }
-  if (source.protocol !== 'https:' && source.protocol !== 'http:') {
-    throw new IngestPlanError('invalid_source_url', 'sourceUrl must be http(s)');
+  if (source.protocol !== 'https:' && !(loopback && source.protocol === 'http:')) {
+    throw new IngestPlanError('invalid_source_url', 'sourceUrl must be https');
   }
   if (source.origin !== allowed.origin) {
     throw new IngestPlanError(

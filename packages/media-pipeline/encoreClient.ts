@@ -290,6 +290,11 @@ export async function submitRenditionJobs(options: {
 }): Promise<{ rendition: EncoreRenditionKey; jobId: string }[]> {
   const submitted: { rendition: EncoreRenditionKey; jobId: string }[] = [];
   for (const rendition of Object.keys(ENCORE_PROFILES) as EncoreRenditionKey[]) {
+    // Stop submitting new renditions once cancelled; jobs already accepted
+    // keep their waitForEncoreJob cancellation path in the catch below.
+    if (options.isCancelled?.()) {
+      throw new Error(`Rendition submission for ${options.videoId} cancelled`);
+    }
     const { profile, queueClass } = await resolveEncoreProfile(ENCORE_PROFILES[rendition]);
     const encoreOutDir = path.join(options.outputDir, 'encore', 'renditions', rendition);
     await mkdir(encoreOutDir, { recursive: true });

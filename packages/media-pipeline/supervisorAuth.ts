@@ -54,7 +54,7 @@ export function isExternallyAuthenticatedPath(pathname: string, method: string):
 export function requiresDashboardAuth(pathname: string, method: string): boolean {
   if (pathname === '/' && method === 'GET') return false;
   if (pathname === '/health' && method === 'GET') return false;
-  if (pathname === '/metrics' && method === 'GET') return false;
+  // /metrics requires the dashboard secret when one is configured.
   // CORS preflights for tus uploads carry no credentials — answer them publicly.
   if (method === 'OPTIONS' && pathname.startsWith('/vmp/uploads')) return false;
   if (isExternallyAuthenticatedPath(pathname, method)) return false;
