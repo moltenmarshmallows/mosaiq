@@ -121,5 +121,17 @@ else
   echo "[repair-d1] skip 0068: magic_link_tokens.otp_hash missing (run ensure_d1 or apply 0068)"
 fi
 
+# 0069/0070 — media-pipeline raw source + pipeline mode columns
+if column_exists videos raw_source_key; then
+  stamp_migration "0069_video_raw_source_key.sql"
+else
+  echo "[repair-d1] skip 0069: videos.raw_source_key missing (run ensure_d1 or apply 0069)"
+fi
+if column_exists videos pipeline_mode; then
+  stamp_migration "0070_video_pipeline_mode.sql"
+else
+  echo "[repair-d1] skip 0070: videos.pipeline_mode missing (run ensure_d1 or apply 0070)"
+fi
+
 echo "[repair-d1] done"
 echo "[repair-d1] Next: either rely on ensure_d1, or re-run: npx wrangler d1 migrations apply ${DB_NAME} ${MODE_FLAG}"

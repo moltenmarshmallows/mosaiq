@@ -24,17 +24,22 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildAggregateEncoreJobDoc } from './encoreAggregate.js';
+import { getEncoreJob } from './encoreClient.js';
+import { IngestPlanError, planIngest } from './ingestSource.js';
 import { gauge, increment } from './metrics.js';
 import { rewriteEncoreJobUrlForPackager } from './packagerEncoreUrl.js';
 import { enqueuePackagerJob } from './packagingQueue.js';
 import {
   getPackagingJob,
+  listPackagingJobs,
   markPackagingFailed,
   markPackagingSuccess,
   registerPackagingJob,
 } from './packagingRegistry.js';
 import { formatDoctorReport, runPipelineDoctor } from './pipelineDoctor.js';
 import {
+  extractBasicAuthPassword,
   isLoopbackHost,
   REBUILD_WEBHOOK_PATHS,
   requiresDashboardAuth,
@@ -42,6 +47,14 @@ import {
   verifyDashboardSecret,
   verifyPackagerCallbackSecret,
 } from './supervisorAuth.js';
+import { planTusIntake, tusdDataDir } from './tusIntake.js';
+import {
+  listWorkers,
+  recordWorkerHeartbeat,
+  redisHealthy,
+  type WorkerGpuBackend,
+} from './workerRegistry.js';
+import { writeObjectBodyToFile } from './writeObjectBodyToFile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = __dirname;
@@ -63,6 +76,20 @@ if (!packagerSecret) {
   console.error('[media-pipeline] Set VMP_PACKAGER_SECRET for packager callback security');
   process.exit(1);
 }
+
+/** Worker heartbeat auth — dedicated token, falls back to the packaging secret. */
+const workerToken = (
+  process.env.VMP_WORKER_TOKEN ||
+  process.env.VMP_PACKAGING_SECRET ||
+  packagingSecret
+).trim();
+const ENCORE_BASE = (process.env.ENCORE_BASE_URL || 'http://127.0.0.1:8080')
+  .trim()
+  .replace(/\/+$/, '');
+const TUSD_URL = (process.env.TUSD_URL || 'http://tusd:1080').trim().replace(/\/+$/, '');
+/** API origin ingest fetch URLs are allowed to point at (SSRF allowlist). */
+const apiBaseUrl = (process.env.VMP_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const WORKER_BACKENDS = new Set<WorkerGpuBackend>(['nvenc', 'vaapi', 'cpu']);
 
 const uiHost = process.env.VMP_UI_HOST || '127.0.0.1';
 const uiPort = Number.parseInt(process.env.VMP_UI_PORT || '8788', 10);
@@ -215,35 +242,36 @@ function pushLog(line) {
   while (logLines.length > MAX_LOG) logLines.shift();
 }
 
+const STAGE_LABELS: Record<string, string> = {
+  detected: 'Detected in watchfolder',
+  deduped: 'Already processing',
+  wait_upload_complete: 'Waiting for file settle',
+  probe: 'Probe source',
+  phase1_encode: 'Phase 1: encode & package 720p',
+  phase1_upload: 'Phase 1: upload 720p to R2',
+  phase1_available: 'Phase 1: 720p watchable',
+  phase2_encode: 'Phase 2: encode 1080p & 480p',
+  phase2_package: 'Phase 2: package multi-rendition HLS',
+  phase2_upload: 'Phase 2: upload renditions to R2',
+  phase2_manifest_swap: 'Phase 2: swap master manifest',
+  multi_rendition_ready: 'All renditions ready',
+  encode: 'Re-encoding renditions',
+  podcast_mp3: 'Encoding podcast MP3',
+  package_hls: 'Packaging HLS',
+  upload_assets: 'Uploading assets to R2',
+  preview_wait: 'Waiting preview lock',
+  preview_render: 'Encoding preview MP3',
+  preview_upload: 'Uploading preview MP3',
+  cleanup: 'Cleanup',
+  done: 'Done',
+  failed: 'Failed',
+  paused: 'Paused',
+  resumed: 'Resumed',
+  stopped: 'Stopped',
+};
+
 function stageLabel(stage) {
-  const labels = {
-    detected: 'Detected in watchfolder',
-    deduped: 'Already processing',
-    wait_upload_complete: 'Waiting for file settle',
-    probe: 'Probe source',
-    phase1_encode: 'Phase 1: encode & package 720p',
-    phase1_upload: 'Phase 1: upload 720p to R2',
-    phase1_available: 'Phase 1: 720p watchable',
-    phase2_encode: 'Phase 2: encode 1080p & 480p',
-    phase2_package: 'Phase 2: package multi-rendition HLS',
-    phase2_upload: 'Phase 2: upload renditions to R2',
-    phase2_manifest_swap: 'Phase 2: swap master manifest',
-    multi_rendition_ready: 'All renditions ready',
-    encode: 'Re-encoding renditions',
-    podcast_mp3: 'Encoding podcast MP3',
-    package_hls: 'Packaging HLS',
-    upload_assets: 'Uploading assets to R2',
-    preview_wait: 'Waiting preview lock',
-    preview_render: 'Encoding preview MP3',
-    preview_upload: 'Uploading preview MP3',
-    cleanup: 'Cleanup',
-    done: 'Done',
-    failed: 'Failed',
-    paused: 'Paused',
-    resumed: 'Resumed',
-    stopped: 'Stopped',
-  };
-  return labels[stage] || stage;
+  return STAGE_LABELS[stage] || stage;
 }
 
 function sortJobQueue(): void {
@@ -493,9 +521,9 @@ let pipelineIpcPath: string | null = null;
 let pipelineRestartTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sendPipelineCommand(
-  cmd: 'pause' | 'resume' | 'stop' | 'reorder',
+  cmd: 'pause' | 'resume' | 'stop' | 'reorder' | 'intake',
   videoId?: string,
-  payload?: { order?: string[] },
+  payload?: { order?: string[]; file?: string; inboxDir?: string; pipelineMode?: string },
 ): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
     if (!pipelineIpcPath) {
@@ -525,6 +553,179 @@ function sendPipelineCommand(
     });
     client.on('error', (err) => finish({ ok: false, error: err.message }));
   });
+}
+
+/**
+ * Publish a completed upload into the inbox: hard link (atomic, never
+ * overwrites), then tell the watcher — link() emits no close_write/moved_to
+ * event so inotify alone can't see it. On EEXIST the file was already
+ * accepted: still send intake so a failed job gets requeued while a
+ * queued/running one dedupes inside maybeEnqueueOnce.
+ */
+type InboxPublishOutcome = 'published' | 'same-file' | 'conflict';
+
+/** destPath → pipelineMode for handoffs the watcher hasn't acknowledged yet. */
+const pendingIntakeHandoffs = new Map<string, string>();
+
+async function sendIntakeHandoff(destPath: string, pipelineMode: string): Promise<void> {
+  const handoff = await sendPipelineCommand('intake', undefined, {
+    file: path.basename(destPath),
+    inboxDir: path.dirname(destPath),
+    pipelineMode,
+  });
+  if (handoff.ok) {
+    pendingIntakeHandoffs.delete(destPath);
+    return;
+  }
+  // The file IS in the inbox — a watcher restart scan picks it up, and the
+  // periodic drain retries meanwhile.
+  pendingIntakeHandoffs.set(destPath, pipelineMode);
+  pushLog(
+    `intake handoff for ${path.basename(destPath)} failed (${handoff.error ?? 'unknown'}) — queued for retry`,
+  );
+}
+
+function drainPendingIntakeHandoffs(): void {
+  for (const [destPath, pipelineMode] of [...pendingIntakeHandoffs]) {
+    void sendIntakeHandoff(destPath, pipelineMode);
+  }
+}
+
+/**
+ * Atomically publish srcPath into the inbox without clobbering an existing
+ * file. Returns 'published', 'same-file' (retry of an already-published
+ * upload — src is the same inode and is removed), or 'conflict' (a different
+ * file already owns the name — src is left for the caller to keep or clean).
+ */
+async function publishToInbox(
+  srcPath: string,
+  destPath: string,
+  pipelineMode: string,
+): Promise<InboxPublishOutcome> {
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+  let outcome: InboxPublishOutcome = 'published';
+  try {
+    await fs.promises.link(srcPath, destPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    // Same inode → src and dest are already the same published file.
+    const [srcStat, destStat] = await Promise.all([
+      fs.promises.stat(srcPath),
+      fs.promises.stat(destPath).catch(() => null),
+    ]);
+    if (destStat && srcStat.dev === destStat.dev && srcStat.ino === destStat.ino) {
+      await fs.promises.rm(srcPath, { force: true });
+      outcome = 'same-file';
+    } else {
+      outcome = 'conflict';
+    }
+  }
+  if (outcome === 'published') await fs.promises.rm(srcPath, { force: true });
+  // No handoff on conflict — the existing file is a different upload.
+  if (outcome !== 'conflict') {
+    await sendIntakeHandoff(destPath, pipelineMode);
+  }
+  return outcome;
+}
+
+/** destPath of ingest requests currently downloading/publishing. */
+const ingestInFlight = new Set<string>();
+
+// tusd re-fires post-finish when our hook response is lost; by then publish
+// already moved the filestore source, so planTusIntake throws 'upload file
+// missing'. Tombstones in .published/ make repeat hooks (and restarts)
+// idempotent while 409 stays for a different upload claiming the name.
+const TUS_PUBLISHED_DIR_NAME = '.published';
+const TUS_PUBLISHED_LIMIT = 4096;
+
+function tusPublishedDir(): string {
+  return path.join(tusdDataDir(process.env), TUS_PUBLISHED_DIR_NAME);
+}
+
+function tusPublishedPath(uploadId: string): string {
+  // Filestore IDs are alnum+hyphen; keep a whitelist anyway since this joins a path.
+  return path.join(tusPublishedDir(), uploadId.replace(/[^a-zA-Z0-9_-]/g, '_'));
+}
+
+async function tusPublishedDestination(uploadId: string): Promise<string | null> {
+  try {
+    return (await fs.promises.readFile(tusPublishedPath(uploadId), 'utf8')).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function recordTusPublished(uploadId: string, destBasename: string): Promise<void> {
+  try {
+    const dir = tusPublishedDir();
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(tusPublishedPath(uploadId), destBasename, 'utf8');
+    // Bound tombstone growth — FIFO sweep of the oldest entries. Stat every
+    // entry before choosing victims; slicing readdir's arbitrary order first
+    // could spare genuinely-oldest tombstones.
+    const entries = (await fs.promises.readdir(dir)).filter((e) => e !== '.' && e !== '..');
+    if (entries.length > TUS_PUBLISHED_LIMIT) {
+      const stats = (
+        await Promise.all(
+          entries.map(async (e) => ({
+            name: e,
+            mtime: (await fs.promises.stat(path.join(dir, e)).catch(() => null))?.mtimeMs ?? 0,
+          })),
+        )
+      ).sort((a, b) => a.mtime - b.mtime);
+      for (const s of stats.slice(0, entries.length - TUS_PUBLISHED_LIMIT)) {
+        await fs.promises.rm(path.join(dir, s.name), { force: true }).catch(() => {});
+      }
+    }
+  } catch {
+    /* a lost tombstone only means a repeat hook re-uses planTusIntake */
+  }
+}
+
+/**
+ * Download + stage + publish an ingest source after the endpoint has already
+ * acked 202. A name conflict means a previous delivery already published this
+ * video — treat as delivered, not an error.
+ */
+async function runSourceIngest(plan: ReturnType<typeof planIngest>): Promise<void> {
+  // No deadline otherwise: a stalled proxy download would pin ingestInFlight
+  // forever and turn every retry of this upload into a deduped no-op.
+  const timeoutMs = Math.max(
+    30_000,
+    Number(process.env.VMP_INGEST_DOWNLOAD_TIMEOUT_MS || 10 * 60 * 1000),
+  );
+  const upstream = await fetch(plan.fetchUrl, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!upstream.ok || !upstream.body) {
+    // Release the response body before bailing — never leak the socket.
+    await upstream.body?.cancel().catch(() => {});
+    throw new Error(`source fetch failed: HTTP ${upstream.status}`);
+  }
+  // Stage inside the destination inbox (hidden subdir the non-recursive
+  // watcher can't see) so link() is guaranteed same-filesystem, then publish
+  // atomically — never clobbering a file the watcher accepted.
+  const stagingDir = path.join(path.dirname(plan.destPath), '.ingest-staging');
+  await fs.promises.mkdir(stagingDir, { recursive: true });
+  const staged = path.join(stagingDir, `${plan.destBasename}.${crypto.randomUUID()}`);
+  try {
+    await writeObjectBodyToFile(upstream.body, staged);
+    const outcome = await publishToInbox(staged, plan.destPath, plan.pipelineMode);
+    if (outcome === 'conflict') {
+      increment('vmp.ingest.conflict', 1, { mode: plan.pipelineMode });
+      pushLog(
+        `ingest conflict: ${plan.destBasename} — destination already published by a different source; manual reconciliation needed`,
+      );
+      return;
+    }
+  } finally {
+    // The staging name is unique per request — remove it even when publish
+    // left it behind (conflict), but never the inbox file itself.
+    await fs.promises.rm(staged, { force: true }).catch(() => {});
+  }
+  increment('vmp.ingest.accepted', 1, { mode: plan.pipelineMode });
+  pushLog(`ingest → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
 }
 
 function consumeIpcSocketLine(line: string): boolean {
@@ -798,6 +999,22 @@ function verifySignature(rawBody, sigHeader, ts) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/** Shared HMAC+timestamp check for signed webhook POSTs; returns error text or null. */
+function verifySignedWebhookRequest(req: http.IncomingMessage, rawBody: Buffer): string | null {
+  if (!secret) return null;
+  const tsHeader = req.headers['x-vmp-timestamp'];
+  const ts = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
+  const tsNum = Number(ts);
+  if (!ts || !Number.isFinite(tsNum) || tsNum <= 0) return 'Invalid or stale timestamp';
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - tsNum) > 5 * 60) return 'Invalid or stale timestamp';
+  const sig = req.headers['x-vmp-signature'];
+  if (!verifySignature(rawBody, Array.isArray(sig) ? sig[0] : sig, ts)) {
+    return 'Invalid signature';
+  }
+  return null;
+}
+
 function timingSafeEqualString(provided: string, expected: string): boolean {
   const a = Buffer.from(provided, 'utf8');
   const b = Buffer.from(expected, 'utf8');
@@ -946,6 +1163,10 @@ function dashboardHtml() {
   <section>
     <h2>Successful jobs log (pipeline)</h2>
     <div id="pipeline-success">Loading…</div>
+  </section>
+  <section>
+    <h2>Encode workers</h2>
+    <div id="workers">Loading…</div>
   </section>
   <section>
     <h2>TTP summaries (time to publish)</h2>
@@ -1124,6 +1345,14 @@ function dashboardHtml() {
           '<tr><td>' + escapeHtml(s.videoId || '') + '</td><td>' + escapeHtml(s.minimalMs != null ? (s.minimalMs / 1000).toFixed(1) + 's' : '—') + '</td><td>' + escapeHtml(s.fullMs != null ? (s.fullMs / 1000).toFixed(1) + 's' : '—') + '</td><td>' + escapeHtml(s.minimalRatio != null ? Number(s.minimalRatio).toFixed(2) + '×' : '—') + '</td><td>' + escapeHtml(s.fullRatio != null ? Number(s.fullRatio).toFixed(2) + '×' : '—') + '</td><td>' + escapeHtml(s.at || '') + '</td></tr>'
         ).join('')
         document.getElementById('ttp').innerHTML = '<table><thead><tr><th>Video</th><th>Minimal (720p)</th><th>Full renditions</th><th>Ratio minimal</th><th>Ratio full</th><th>At</th></tr></thead><tbody>' + ttpRows + '</tbody></table>'
+        const workerRows = (d.workers || []).map(w =>
+          '<tr><td>' + escapeHtml(w.hostname || w.workerId || '') + '</td><td>' + escapeHtml(w.gpuBackend || '') +
+          '</td><td>' + escapeHtml(String(w.pollQueue ?? '')) + '</td><td>' + escapeHtml(w.version || '—') +
+          '</td><td>' + escapeHtml(w.lastSeenAt || '') + '</td></tr>'
+        ).join('')
+        document.getElementById('workers').innerHTML = workerRows
+          ? '<table><thead><tr><th>Worker</th><th>Backend</th><th>Poll queue</th><th>Version</th><th>Last heartbeat</th></tr></thead><tbody>' + workerRows + '</tbody></table>'
+          : '<p>No live workers — jobs will queue until a worker compose registers.</p>'
         document.getElementById('log').textContent = (d.logLines || []).join('\\n')
       } catch (e) {
         document.getElementById('pipeline').textContent = 'Error: ' + e
@@ -1200,6 +1429,7 @@ const server = http.createServer(async (req, res) => {
       pipelineActiveJobs: activeRows,
       pipelineSuccessfulJobs: successRows,
       failedPipelineJobs: failedRows,
+      workers: await listWorkers(),
       ttpSummaries,
       logLines,
     });
@@ -1234,32 +1464,10 @@ const server = http.createServer(async (req, res) => {
     }
     const rawBody = Buffer.concat(chunks);
 
-    if (secret) {
-      // Validate timestamp freshness
-      const tsHeader = req.headers['x-vmp-timestamp'];
-      const ts = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
-      if (!ts) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-      const tsNum = Number(ts);
-      if (!Number.isFinite(tsNum) || tsNum <= 0) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-      const nowSec = Math.floor(Date.now() / 1000);
-      const skewWindow = 5 * 60; // 5 minutes in seconds
-      if (Math.abs(nowSec - tsNum) > skewWindow) {
-        json(res, { error: 'Invalid or stale timestamp' }, 401);
-        return;
-      }
-
-      // Verify signature
-      const sig = req.headers['x-vmp-signature'];
-      if (!verifySignature(rawBody, Array.isArray(sig) ? sig[0] : sig, ts)) {
-        json(res, { error: 'Invalid signature' }, 401);
-        return;
-      }
+    const webhookAuthError = verifySignedWebhookRequest(req, rawBody);
+    if (webhookAuthError) {
+      json(res, { error: webhookAuthError }, 401);
+      return;
     }
 
     let payload;
@@ -1341,7 +1549,13 @@ const server = http.createServer(async (req, res) => {
     /^\/api\/jobs\/([^/]+)\/(pause|resume|stop|priority)$/,
   );
   if (req.method === 'POST' && jobControlMatch) {
-    const videoId = decodeURIComponent(jobControlMatch[1]);
+    let videoId: string;
+    try {
+      videoId = decodeURIComponent(jobControlMatch[1]);
+    } catch {
+      json(res, { error: 'Invalid job id' }, 400);
+      return;
+    }
     const action = jobControlMatch[2];
     if (action === 'priority') {
       const body = await readJsonBody(req);
@@ -1436,9 +1650,19 @@ const server = http.createServer(async (req, res) => {
       videoId?: string;
       stage?: string;
       pipelineMode?: string;
+      aggregate?: { inputUri?: string; memberJobIds?: string[] };
     };
     if (!reg.jobId || !reg.encoreJobUrl || !reg.videoId || !reg.stage || !reg.pipelineMode) {
       json(res, { error: 'Missing required fields' }, 400);
+      return;
+    }
+    if (
+      reg.aggregate &&
+      (!reg.aggregate.inputUri ||
+        !Array.isArray(reg.aggregate.memberJobIds) ||
+        reg.aggregate.memberJobIds.length === 0)
+    ) {
+      json(res, { error: 'aggregate requires inputUri and memberJobIds' }, 400);
       return;
     }
     const validStages: string[] = ['fast_lane_preview', 'full_ladder'];
@@ -1463,12 +1687,33 @@ const server = http.createServer(async (req, res) => {
     if (packagerJobUrl !== reg.encoreJobUrl) {
       pushLog(`packaging rewrite encoreJobUrl ${reg.encoreJobUrl} → ${packagerJobUrl}`);
     }
+    // Aggregate URLs are fetched by the packager, which sends no headers —
+    // embed a one-shot per-job token rather than the master secret so the
+    // credential persisted in Redis (registry + queue message) is scoped to
+    // this job only.
+    let aggregateToken: string | undefined;
+    if (reg.aggregate) {
+      aggregateToken = crypto.randomUUID();
+      const parsed = new URL(packagerJobUrl);
+      parsed.username = 'vmp';
+      parsed.password = aggregateToken;
+      packagerJobUrl = parsed.toString();
+    }
     await registerPackagingJob({
       jobId: String(reg.jobId),
       encoreJobUrl: packagerJobUrl,
       videoId: String(reg.videoId),
       stage: reg.stage as 'fast_lane_preview' | 'full_ladder',
       pipelineMode: reg.pipelineMode as 'fast_lane' | 'full_ladder',
+      aggregate: reg.aggregate
+        ? {
+            inputUri: String(reg.aggregate.inputUri || ''),
+            memberJobIds: Array.isArray(reg.aggregate.memberJobIds)
+              ? reg.aggregate.memberJobIds.map(String)
+              : [],
+          }
+        : undefined,
+      aggregateToken,
     });
     try {
       await enqueuePackagerJob(String(reg.jobId), packagerJobUrl);
@@ -1489,7 +1734,13 @@ const server = http.createServer(async (req, res) => {
       json(res, { error: 'Unauthorized' }, 401);
       return;
     }
-    const jobId = decodeURIComponent(packagingStatusMatch[1]);
+    let jobId: string;
+    try {
+      jobId = decodeURIComponent(packagingStatusMatch[1]);
+    } catch {
+      json(res, { error: 'Invalid job id' }, 400);
+      return;
+    }
     const job = await getPackagingJob(jobId);
     if (!job) {
       json(res, { error: 'Not found' }, 404);
@@ -1534,7 +1785,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (outcome === 'success') {
-      await markPackagingSuccess(jobId, payload.outputPath ? String(payload.outputPath) : undefined);
+      await markPackagingSuccess(
+        jobId,
+        payload.outputPath ? String(payload.outputPath) : undefined,
+      );
       pushLog(`packager success jobId=${jobId}`);
     } else {
       const errMsg = String(payload.error || payload.message || 'packager failure');
@@ -1545,9 +1799,467 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Encode worker fleet ────────────────────────────────────────────────
+  if (req.method === 'POST' && url.pathname === '/api/workers/heartbeat') {
+    if (!workerToken || !verifyWorkerToken(req)) {
+      json(res, { error: 'Unauthorized' }, 401);
+      return;
+    }
+    const body = (await readJsonBody(req)) as {
+      workerId?: string;
+      hostname?: string;
+      gpuBackend?: string;
+      pollQueue?: number;
+      pollHigherPrio?: boolean;
+      version?: string;
+    } | null;
+    const workerId = String(body?.workerId || '').trim();
+    const gpuBackend = String(body?.gpuBackend || '').trim() as WorkerGpuBackend;
+    const pollQueue = Number(body?.pollQueue);
+    if (
+      !/^[a-zA-Z0-9._:-]{1,128}$/.test(workerId) ||
+      !WORKER_BACKENDS.has(gpuBackend) ||
+      !Number.isInteger(pollQueue) ||
+      pollQueue < 0 ||
+      pollQueue > 16 ||
+      // Reject rather than coerce a malformed capability — a truthy string
+      // would silently register a worker as higher-prio-capable.
+      (body?.pollHigherPrio !== undefined && typeof body.pollHigherPrio !== 'boolean')
+    ) {
+      json(res, { error: 'Invalid worker heartbeat' }, 400);
+      return;
+    }
+    const record = await recordWorkerHeartbeat({
+      workerId,
+      hostname: String(body?.hostname || workerId).slice(0, 128),
+      gpuBackend,
+      pollQueue,
+      pollHigherPrio:
+        typeof body?.pollHigherPrio === 'boolean' ? body.pollHigherPrio : undefined,
+      version: body?.version ? String(body.version).slice(0, 64) : undefined,
+    });
+    json(res, { ok: true, worker: record });
+    return;
+  }
+
+  // ── Packager-facing aggregate job doc (rendition-split ladders) ────────
+  const aggregateMatch = url.pathname.match(/^\/vmp\/api\/encoreJobAggregate\/([^/]+)$/);
+  if (req.method === 'GET' && aggregateMatch) {
+    let aggregateJobId: string;
+    try {
+      aggregateJobId = decodeURIComponent(aggregateMatch[1]);
+    } catch {
+      json(res, { error: 'Invalid job id' }, 400);
+      return;
+    }
+    const record = await getPackagingJob(aggregateJobId);
+    if (!record?.aggregate) {
+      json(res, { error: 'Not found' }, 404);
+      return;
+    }
+    // The packager authenticates with the per-job token embedded in its copy
+    // of encoreJobUrl. Records queued before that rollout have no token and
+    // carry the shared secret instead — keep accepting it until they drain.
+    const password = extractBasicAuthPassword(req);
+    const authorized = record.aggregateToken
+      ? password !== null && timingSafeEqualString(password, record.aggregateToken)
+      : verifyPackagerCallbackSecret(req, packagerSecret || '');
+    if (!authorized) {
+      json(res, { error: 'Unauthorized' }, 401);
+      return;
+    }
+    try {
+      const members = await Promise.all(record.aggregate.memberJobIds.map(getEncoreJob));
+      const doc = buildAggregateEncoreJobDoc(
+        {
+          jobId: record.jobId,
+          videoId: record.videoId,
+          inputUri: record.aggregate.inputUri,
+          memberJobIds: record.aggregate.memberJobIds,
+        },
+        members,
+      );
+      json(res, doc);
+    } catch (err) {
+      json(res, { error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+    return;
+  }
+
+  // ── tusd post-finish hook → move completed upload into the inbox ───────
+  if (req.method === 'POST' && url.pathname === '/vmp/api/tus-hook') {
+    if (!verifyPackagerCallbackSecret(req, packagerSecret || '')) {
+      json(res, { error: 'Unauthorized' }, 401);
+      return;
+    }
+    const body = await readJsonBody(req);
+    try {
+      const uploadId = String(
+        (body as { Event?: { Upload?: { ID?: string } } })?.Event?.Upload?.ID ??
+          (body as { event?: { upload?: { id?: string } } })?.event?.upload?.id ??
+          '',
+      );
+      // Durable replay dedupe — after a successful publish the filestore
+      // source is gone, so a replayed hook must be answered from the tombstone
+      // before planTusIntake can touch the (now-missing) file.
+      if (uploadId) {
+        const published = await tusPublishedDestination(uploadId);
+        if (published) {
+          json(res, { ok: true, file: published, replayed: true });
+          return;
+        }
+      }
+      const plan = planTusIntake(body as Parameters<typeof planTusIntake>[0]);
+      if (!plan) {
+        json(res, { ok: true, ignored: true });
+        return;
+      }
+      const outcome = await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      if (outcome === 'conflict') {
+        // A different upload already owns this destination — the source file
+        // stays in TUSD_DATA_DIR for operator reconciliation instead of being
+        // silently accepted as the wrong video.
+        json(res, { error: 'Destination already exists for a different upload', code: 'conflict' }, 409);
+        return;
+      }
+      if (uploadId) await recordTusPublished(uploadId, plan.destBasename);
+      increment('vmp.tus.upload.accepted', 1, { mode: plan.pipelineMode });
+      pushLog(`tus upload → ${plan.pipelineMode} inbox: ${plan.destBasename}`);
+      json(res, { ok: true, file: plan.destBasename, pipelineMode: plan.pipelineMode });
+    } catch (err) {
+      json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    return;
+  }
+
+  // ── API-driven ingest: pull a raw upload through the video proxy → inbox ──
+  if (req.method === 'POST' && url.pathname === '/vmp/api/ingest') {
+    // This route is exempt from dashboard auth; it must fail closed on HMAC
+    // even when VMP_REQUIRE_WEBHOOK_SECRET=0.
+    if (!secret) {
+      json(res, { error: 'Webhook secret not configured' }, 503);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let byteCount = 0;
+    try {
+      for await (const c of req) {
+        byteCount += c.length;
+        if (byteCount > MAX_BODY_SIZE) {
+          json(res, { error: 'Request body too large' }, 413);
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      }
+    } catch {
+      if (!res.writableEnded && !res.destroyed) {
+        json(res, { error: 'Request body read failed' }, 400);
+      }
+      return;
+    }
+    const rawBody = Buffer.concat(chunks);
+    const authError = verifySignedWebhookRequest(req, rawBody);
+    if (authError) {
+      json(res, { error: authError }, 401);
+      return;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+      json(res, { error: 'Invalid JSON' }, 400);
+      return;
+    }
+    let plan;
+    try {
+      plan = planIngest(payload as Parameters<typeof planIngest>[0], apiBaseUrl);
+    } catch (err) {
+      json(
+        res,
+        {
+          error: err instanceof Error ? err.message : String(err),
+          code: err instanceof IngestPlanError ? err.code : 'invalid_request',
+        },
+        400,
+      );
+      return;
+    }
+    // Acknowledge the durable intake request immediately — the download can
+    // take minutes for large sources, so /complete must not wait for it.
+    // Deduped by destination: a concurrent retry of the same upload is a no-op.
+    const dedupeKey = plan.destPath;
+    if (!ingestInFlight.has(dedupeKey)) {
+      ingestInFlight.add(dedupeKey);
+      void runSourceIngest(plan)
+        .catch((err) =>
+          pushLog(
+            `ingest failed for ${plan.destBasename}: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        )
+        .finally(() => ingestInFlight.delete(dedupeKey));
+    }
+    json(res, { ok: true, accepted: true, file: plan.destBasename, pipelineMode: plan.pipelineMode }, 202);
+    return;
+  }
+
+  // ── Authenticated TUS upload endpoint (proxied to tusd) ────────────────
+  if (url.pathname === '/vmp/uploads' || url.pathname.startsWith('/vmp/uploads/')) {
+    await proxyTusRequest(req, res, url.pathname);
+    return;
+  }
+
+  // ── Prometheus metrics ─────────────────────────────────────────────────
+  if (req.method === 'GET' && url.pathname === '/metrics') {
+    const text = await buildMetricsText();
+    res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+    res.end(text);
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
+
+function verifyWorkerToken(req: http.IncomingMessage): boolean {
+  const header = req.headers['x-vmp-worker-token'];
+  const provided = Array.isArray(header) ? header[0] : header;
+  if (typeof provided === 'string' && provided.length > 0) {
+    return timingSafeEqualString(provided, workerToken);
+  }
+  return verifyPackagerCallbackSecret(req, workerToken);
+}
+
+/** Proxy /vmp/uploads[/<id>] → tusd /files[/<id>]; dashboard auth already applied. */
+async function proxyTusRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+): Promise<void> {
+  const corsHeaders: Record<string, string> = {
+    'Access-Control-Allow-Origin': req.headers.origin || '*',
+    'Access-Control-Allow-Methods': 'POST, HEAD, PATCH, OPTIONS, DELETE',
+    'Access-Control-Allow-Headers':
+      'Authorization, Content-Type, Upload-Length, Upload-Offset, Upload-Metadata, Tus-Resumable',
+    'Access-Control-Expose-Headers': 'Location, Upload-Offset, Upload-Length, Tus-Resumable',
+    'Tus-Resumable': '1.0.0',
+  };
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { ...corsHeaders, 'Tus-Version': '1.0.0', 'Tus-Extension': 'creation' });
+    res.end();
+    return;
+  }
+  const suffix = pathname === '/vmp/uploads' ? '' : pathname.slice('/vmp/uploads'.length);
+  const upstream = new URL(`${TUSD_URL}/files${suffix}`);
+  const headers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    const key = k.toLowerCase();
+    if (
+      ['host', 'authorization', 'x-vmp-supervisor-token', 'connection', 'content-length'].includes(
+        key,
+      )
+    ) {
+      continue;
+    }
+    if (typeof v === 'string') headers[k] = v;
+  }
+  const proxyReq = http.request(
+    upstream,
+    { method: req.method, headers, timeout: 0 },
+    (proxyRes) => {
+      const outHeaders: Record<string, string | string[]> = { ...corsHeaders };
+      for (const [k, v] of Object.entries(proxyRes.headers)) {
+        if (v == null) continue;
+        const key = k.toLowerCase();
+        if (key === 'location') {
+          // tusd returns http://tusd:1080/files/<id> — rewrite to our public path.
+          outHeaders[k] = String(v).replace(
+            /^https?:\/\/[^/]+\/files/,
+            `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}/vmp/uploads`,
+          );
+          continue;
+        }
+        if (key === 'connection' || key === 'transfer-encoding') continue;
+        outHeaders[k] = v as string | string[];
+      }
+      res.writeHead(proxyRes.statusCode || 502, outHeaders);
+      // If tusd drops mid-body, pipe() alone leaves the error unhandled and
+      // crashes the supervisor — only the downstream response should die.
+      proxyRes.on('error', () => res.destroy());
+      proxyRes.pipe(res);
+    },
+  );
+  proxyReq.on('timeout', () => proxyReq.destroy(new Error('tusd upstream timeout')));
+  proxyReq.on('error', (err) => {
+    if (!res.headersSent) json(res, { error: `tusd unreachable: ${err.message}` }, 502);
+    else res.destroy();
+  });
+  req.pipe(proxyReq);
+}
+
+async function buildMetricsText(): Promise<string> {
+  const lines: string[] = [];
+  const g = (name: string, value: number, labels = '') => {
+    lines.push(`vmp_${name}${labels ? `{${labels}}` : ''} ${Number.isFinite(value) ? value : 0}`);
+  };
+  const esc = (s: string) => s.replace(/["\\]/g, '\\$&');
+
+  g('pipeline_child_alive', pipelineChild && !pipelineState.exited ? 1 : 0);
+  g('pipeline_queue_depth', jobQueue.filter((j) => j.status === 'queued').length);
+  g('supervisor_gpu_slots_used', gpuSlots.current);
+  g('supervisor_gpu_slots_max', gpuSlots.max);
+  g('supervisor_upload_slots_used', uploadSlots.current);
+  g('supervisor_upload_slots_max', uploadSlots.max);
+
+  const stageCounts = new Map<string, number>();
+  for (const job of pipelineActiveJobs.values()) {
+    const stage = String(job.stage || 'unknown');
+    stageCounts.set(stage, (stageCounts.get(stage) || 0) + 1);
+  }
+  // Emit every known stage (zero included) so graphs don't go stale when the
+  // last job leaves a stage.
+  for (const stage of Object.keys(STAGE_LABELS)) {
+    g('pipeline_active_jobs', stageCounts.get(stage) ?? 0, `stage="${esc(stage)}"`);
+  }
+  for (const [stage, count] of stageCounts) {
+    if (!(stage in STAGE_LABELS)) g('pipeline_active_jobs', count, `stage="${esc(stage)}"`);
+  }
+  g('pipeline_jobs_failed_total', failedPipelineJobs.length);
+  g('pipeline_jobs_success_total', pipelineSuccessfulJobs.length);
+
+  const workers = await listWorkers();
+  const byBackend = new Map<string, number>();
+  for (const w of workers) byBackend.set(w.gpuBackend, (byBackend.get(w.gpuBackend) || 0) + 1);
+  for (const backend of ['cpu', 'nvenc', 'vaapi']) {
+    g('workers', byBackend.get(backend) ?? 0, `backend="${esc(backend)}"`);
+    byBackend.delete(backend);
+  }
+  for (const [backend, count] of byBackend) g('workers', count, `backend="${esc(backend)}"`);
+  g('workers_total', workers.length);
+
+  const packagerStatusCounts = new Map<string, number>();
+  for (const job of listPackagingJobs()) {
+    const status = String(job.status || 'unknown');
+    packagerStatusCounts.set(status, (packagerStatusCounts.get(status) || 0) + 1);
+  }
+  for (const [status, count] of packagerStatusCounts) {
+    g('packaging_jobs', count, `status="${esc(status)}"`);
+  }
+
+  g('redis_up', (await redisHealthy()) ? 1 : 0);
+
+  let encoreUp = 0;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const r = await fetch(`${ENCORE_BASE}/queueCount`, { signal: controller.signal });
+      if (r.ok) {
+        const data = (await r.json()) as unknown;
+        const counts = Array.isArray(data)
+          ? data
+          : data && typeof data === 'object'
+            ? Object.values(data as Record<string, unknown>)
+            : [];
+        // Mark Encore up only once a parseable, non-empty queue map arrived.
+        if (counts.length > 0) {
+          encoreUp = 1;
+          counts.forEach((v, i) => {
+            if (typeof v === 'number') g('encore_queue_depth', v, `queue="${i}"`);
+          });
+        }
+      }
+    } finally {
+      // Timer covers body consumption too — a dead Encore mid-JSON still
+      // reports worker/pipeline/redis metrics via the outer catch.
+      clearTimeout(timer);
+    }
+  } catch {
+    /* encore down */
+  }
+  g('encore_up', encoreUp);
+
+  const lastTtp = ttpSummaries[0];
+  if (lastTtp) {
+    if (lastTtp.minimalMs != null) g('ttp_last_minimal_ms', lastTtp.minimalMs);
+    if (lastTtp.fullMs != null) g('ttp_last_full_ms', lastTtp.fullMs);
+    g('ttp_last_total_ms', lastTtp.totalMs);
+  }
+  g('process_uptime_seconds', Math.floor(process.uptime()));
+  g('process_rss_bytes', process.memoryUsage().rss);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Replays completed tusd uploads whose post-finish hook exhausted retries
+ * while the supervisor was down — the file + .info sidecar sit in
+ * TUSD_DATA_DIR until something moves them into the inbox.
+ */
+async function recoverOrphanedTusUploads(): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(tusdDataDir());
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith('.info')) continue;
+    try {
+      const info = JSON.parse(await fs.promises.readFile(path.join(tusdDataDir(), entry), 'utf8')) as {
+        ID?: string;
+        IsFinal?: boolean;
+        IsPartial?: boolean;
+        Offset?: number;
+        Size?: number;
+        SizeIsDeferred?: boolean;
+        MetaData?: Record<string, string>;
+        Storage?: { Type?: string; Path?: string };
+      };
+      // A leftover .info from an already-published upload — the source file
+      // was moved out; the tombstone is the record of delivery.
+      if (info.ID && (await tusPublishedDestination(info.ID))) continue;
+      // Completion proof = the stored file matching a declared, non-deferred
+      // length. Offset in the sidecar can lag (filestore keeps it in memory),
+      // IsFinal alone doesn't prove concatenation finished, and a deferred
+      // upload with Size=0 must never be moved out from under a live resume.
+      const st = info.Storage?.Path
+        ? await fs.promises.stat(info.Storage.Path).catch(() => null)
+        : null;
+      const complete =
+        st !== null &&
+        info.SizeIsDeferred !== true &&
+        typeof info.Size === 'number' &&
+        info.Size > 0 &&
+        st.size === info.Size;
+      // Already-consumed uploads leave a stale .info behind — skip quietly.
+      if (!complete || !st) continue;
+      const uploadId = info.ID ?? entry.replace(/\.info$/, '');
+      const plan = planTusIntake({
+        Type: 'post-finish',
+        Event: {
+          Upload: {
+            ID: uploadId,
+            IsPartial: info.IsPartial,
+            MetaData: info.MetaData,
+            Storage: info.Storage,
+          },
+        },
+      });
+      if (!plan) continue;
+      const outcome = await publishToInbox(plan.srcPath, plan.destPath, plan.pipelineMode);
+      if (outcome === 'conflict') {
+        pushLog(`tus recovery: ${entry} conflicts with an existing inbox file — needs operator review`);
+        continue;
+      }
+      await recordTusPublished(uploadId, plan.destBasename);
+      pushLog(`tus recovery: republished orphaned upload ${entry}`);
+    } catch (err) {
+      pushLog(
+        `tus recovery: skipped ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
 
 async function bootSupervisor(): Promise<void> {
   if (process.env.VMP_SKIP_PIPELINE_DOCTOR !== '1') {
@@ -1555,7 +2267,9 @@ async function bootSupervisor(): Promise<void> {
     const report = await runPipelineDoctor(process.env);
     process.stdout.write(`${formatDoctorReport(report)}\n`);
     if (!report.ok) {
-      console.error('[media-pipeline] Pipeline doctor failed — fix env/deps or set VMP_SKIP_PIPELINE_DOCTOR=1');
+      console.error(
+        '[media-pipeline] Pipeline doctor failed — fix env/deps or set VMP_SKIP_PIPELINE_DOCTOR=1',
+      );
       process.exit(1);
     }
   } else {
@@ -1581,8 +2295,10 @@ async function bootSupervisor(): Promise<void> {
     process.exit(1);
   }
   startPipeline();
+  void recoverOrphanedTusUploads();
   setInterval(() => {
     reportSupervisorMetrics();
+    drainPendingIntakeHandoffs();
     if (pipelineChild && !pipelineState.exited && !hasStuckRunningJobs()) {
       void sdNotify('WATCHDOG=1');
     }

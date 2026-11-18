@@ -1343,9 +1343,26 @@
     if (!descriptionExpanded.value) measureDescriptionClamp();
   });
 
+  /** Progressive fallback is only useful if this browser decodes the container. */
+  const canPlayProgressive = (url: string): boolean => {
+    const ext = (url.split('?')[0] ?? '').split('.').pop()?.toLowerCase() ?? '';
+    const mime = {
+      mp4: 'video/mp4',
+      m4v: 'video/mp4',
+      webm: 'video/webm',
+      mov: 'video/quicktime',
+    }[ext];
+    if (!mime) return false; // mkv etc. — wait for HLS instead of a hard fail
+    try {
+      return document.createElement('video').canPlayType(mime) !== '';
+    } catch {
+      return false;
+    }
+  };
   const formatDuration = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const total = Math.floor(seconds);
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
@@ -2263,6 +2280,9 @@
     }
 
     try {
+      // Reset before every load so a previous video's resolved duration can't
+      // leak into the offline fallback (which sets fullDuration: null).
+      resolvedFullDuration.value = 0;
       try {
         await fetchVideoAccess({
           videoId: targetVideoId,
@@ -2374,6 +2394,14 @@
         return;
       }
       const playlistUrl = videoData.value?.video?.playlistUrl;
+      // Raw upload still encoding → progressive MP4 through the same proxy —
+      // but only when this browser can actually decode the container (a .mov
+      // or .mkv source would hard-fail on Chrome; better to wait for HLS).
+      const progressiveUrl =
+        typeof videoData.value?.video?.progressiveUrl === 'string'
+          ? videoData.value.video.progressiveUrl
+          : null;
+      const mediaUrl = playlistUrl || (progressiveUrl && canPlayProgressive(progressiveUrl) ? progressiveUrl : null);
       // Warm cheapest rung + first segments while Video.js boots (and share Worker cache).
       if (playlistUrl && !rateLimited.value) {
         void import('~/utils/hlsStartupPrefetch')
@@ -2394,9 +2422,9 @@
           : Promise.resolve({ ok: true as const });
 
       let usedOfflineSource = playingOffline.value;
-      if (playlistUrl && !rateLimited.value) {
+      if (mediaUrl && !rateLimited.value) {
         error.value = null;
-        let resolvedPlaylist = playlistUrl;
+        let resolvedPlaylist = mediaUrl;
         if (videoData.value?.hasAccess && !usedOfflineSource) {
           try {
             const offline = await getOfflineSource(
@@ -2442,6 +2470,22 @@
           videoData.value?.videoId ?? targetVideoId,
           guard,
         );
+      } else if (!rateLimited.value) {
+        // No playable source yet — still encoding, or the raw container is one
+        // this browser can't decode. Stop whatever the previous video left
+        // running instead of leaving it playing under the new page.
+        const stale = getPlaybackVideo();
+        if (stale) {
+          stale.pause();
+          stale.removeAttribute('src');
+          stale.load();
+        }
+        teardownVideoListeners();
+        error.value = null;
+        playbackUnavailable.value = true;
+        // Awaited like the other unavailable paths — a detached promise would
+        // swallow a cancellation rejection that the enclosing catch handles.
+        await loadBrowseRecommendations(options.signal);
       }
       await recommendationsPromise.catch(() => undefined);
     } catch (e: any) {
@@ -2626,6 +2670,27 @@
     handleLoadedMetadata = () => {
       if (!isCurrentInvocation()) return;
       applyPendingResume();
+      // Progressive MP4 path: D1 often has full_duration=0 while the raw file
+      // is encoding — take the element's real duration so seek/preview-lock UI works.
+      const el = (nativeVideoWithListeners ?? getNativeVideoElement(video)) as HTMLMediaElement | null;
+      const mediaDuration = el?.duration ?? 0;
+      // Only trust the element duration on the progressive source — a clipped
+      // HLS preview reports the preview length and would shrink the
+      // full-duration UI. Test what the element ACTUALLY loaded (currentSrc),
+      // not which URL fields the payload happened to carry.
+      const progressiveSrc =
+        typeof videoData.value?.video?.progressiveUrl === 'string'
+          ? videoData.value.video.progressiveUrl
+          : null;
+      const isProgressive = !!progressiveSrc && !!el?.currentSrc?.includes(progressiveSrc);
+      if (
+        !resolvedFullDuration.value &&
+        isProgressive &&
+        Number.isFinite(mediaDuration) &&
+        mediaDuration > 0
+      ) {
+        resolvedFullDuration.value = mediaDuration;
+      }
       if (import.meta.env.DEV) {
         console.log('Video metadata loaded');
       }

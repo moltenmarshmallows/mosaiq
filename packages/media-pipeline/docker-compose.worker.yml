@@ -1,0 +1,125 @@
+# VMP media pipeline — WORKER NODE.
+#
+# Runs the VMP encore-worker: probes real hardware encodes (NVENC → VAAPI →
+# CPU), heartbeats the detected backend to the supervisor, then polls the
+# correct Redis priority queues. Run one instance per host, or several for
+# more concurrency — each registers independently in the dashboard.
+#
+# Same host as the coordinator (minimal example):
+#   docker compose -f docker-compose.worker.yml --env-file .env up -d
+#
+# Remote host (LAN/cloud): copy this file + .env, mount the SAME media tree at
+# /media (NFS export of the coordinator's media dir), then set in .env:
+#   VMP_COORDINATOR=coordinator.lan   # hostname/IP of the coordinator
+# and create the (unused, but referenced) network once:
+#   docker network create vmp-media
+# and start the GPU variant matching the hardware:
+#   docker compose -f docker-compose.worker.yml --env-file .env --profile nvidia up -d
+#   docker compose -f docker-compose.worker.yml --env-file .env --profile vaapi  up -d
+#
+# Optional packager on this node (needs the media plane + Redis queue):
+#   docker compose -f docker-compose.worker.yml --env-file .env --profile packager up -d
+
+name: vmp-media-worker
+
+x-worker-env: &worker-env
+  # Redis requires a password (coordinator sets --requirepass) — same
+  # VMP_REDIS_PASSWORD as the coordinator's .env.
+  # shortcut: plaintext redis:// only over a trusted LAN/VPN; for untrusted
+  # links set WORKER_REDIS_URI=rediss://... against a TLS terminator in front
+  # of the coordinator's Redis (upgrade when Redis gains native TLS here).
+  ENCORE_SETTINGS_REDIS_URI: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD}@${VMP_COORDINATOR:-redis}:6379}
+  ENCORE_SETTINGS_PROFILE_LOCATION: file:/profiles/profiles.yml
+  ENCORE_SETTINGS_SHARED_WORK_DIR: /shared/work
+  ENCORE_SETTINGS_CONCURRENCY: "2"
+  # Supervisor base URL — passes through whatever the operator set (the
+  # heartbeat sends X-VMP-Worker-Token, so remote workers should point this at
+  # an https:// TLS terminator, not a cleartext http:// hop).
+  VMP_SUPERVISOR_URL: ${VMP_SUPERVISOR_URL:-http://${VMP_COORDINATOR:-vmp-supervisor}:8788}
+  VMP_WORKER_TOKEN: ${VMP_WORKER_TOKEN:?Set VMP_WORKER_TOKEN in .env (shared with coordinator)}
+  VMP_WORKER_HEARTBEAT_S: ${VMP_WORKER_HEARTBEAT_S:-30}
+  ENCORE_WORKER_IDLE_SLEEP_S: ${ENCORE_WORKER_IDLE_SLEEP_S:-5}
+  VMP_WORKER_VERSION: ${VMP_WORKER_VERSION:-docker}
+  # Optional: pin the registry identity / force a backend for testing.
+  VMP_WORKER_ID: ${VMP_WORKER_ID:-}
+  VMP_FORCE_BACKEND: ${VMP_FORCE_BACKEND:-}
+
+x-worker-common: &worker-common
+  image: ${VMP_WORKER_IMAGE:-ghcr.io/moltenmarshmallows/vmp-encore-worker:latest}
+  build:
+    context: .
+    dockerfile: worker/Dockerfile
+  restart: unless-stopped
+  networks: [vmp-media]
+  environment: *worker-env
+  volumes:
+    - ${ENCORE_MEDIA_MOUNT:-/mnt}:/media
+    - worker-shared-work:/shared/work
+
+networks:
+  # Same-host minimal example: workers join the coordinator network so `redis`
+  # / `vmp-supervisor` names resolve. Remote workers set VMP_COORDINATOR to the
+  # coordinator IP instead — then only /media + outbound HTTP/Redis are needed.
+  vmp-media:
+    name: vmp-media
+    external: true
+
+services:
+  # CPU-only worker (no GPU device passed). Also the auto-detect fallback.
+  worker:
+    <<: *worker-common
+
+  # NVIDIA — requires nvidia-container-toolkit on the host.
+  #   docker compose ... --profile nvidia up -d worker-nvidia
+  worker-nvidia:
+    <<: *worker-common
+    profiles: [nvidia]
+    environment:
+      <<: *worker-env
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,video,utility}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # AMD / Intel iGPU / Arc — VAAPI via /dev/dri (QSV rides the same path).
+  #   docker compose ... --profile vaapi up -d worker-vaapi
+  worker-vaapi:
+    <<: *worker-common
+    profiles: [vaapi]
+    devices:
+      - ${VAAPI_DEVICE:-/dev/dri/renderD128}:/dev/dri/renderD128
+    group_add:
+      - video
+
+  # Optional local packager — drains the shared Redis packaging queue.
+  # Remote packagers: the queued Encore job URLs point at whatever
+  # PACKAGER_ENCORE_BASE_URL (normal jobs) / PACKAGER_SUPERVISOR_BASE_URL
+  # (aggregate jobs) the coordinator advertised — make sure this host can
+  # resolve them, or remote packagers only succeed on aggregate jobs.
+  encore-packager:
+    profiles: [packager]
+    image: eyevinntechnology/encore-packager:latest
+    restart: unless-stopped
+    networks: [vmp-media]
+    environment:
+      REDIS_URL: ${WORKER_REDIS_URI:-redis://:${VMP_REDIS_PASSWORD:-}@${VMP_COORDINATOR:-redis}:6379}
+      REDIS_QUEUE: ${REDIS_QUEUE:-packaging-queue}
+      CALLBACK_URL: ${PACKAGER_CALLBACK_URL:-http://vmp:${VMP_PACKAGER_SECRET:-}@${VMP_COORDINATOR:-vmp-supervisor}:8788/vmp/api}
+      PACKAGE_OUTPUT_FOLDER: ${PACKAGE_OUTPUT_FOLDER:-}
+      OUTPUT_SUBFOLDER_TEMPLATE: ${OUTPUT_SUBFOLDER_TEMPLATE:-/$$EXTERNALID$$}
+      HLS_MANIFEST_NAME_TEMPLATE: ${HLS_MANIFEST_NAME_TEMPLATE:-master.m3u8}
+      PACKAGE_FORMAT_OPTIONS_JSON: ${PACKAGE_FORMAT_OPTIONS_JSON:-{"segmentDuration":2}}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-${B2_S3_ENDPOINT:-}}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-${B2_ACCESS_KEY_ID:-}}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-${B2_SECRET_ACCESS_KEY:-}}
+      AWS_REGION: ${AWS_REGION:-${B2_REGION:-auto}}
+    volumes:
+      - ${ENCORE_MEDIA_MOUNT:-/mnt}:/media
+
+volumes:
+  worker-shared-work:

@@ -5,6 +5,7 @@
 
 import type { D1Database } from '@cloudflare/workers-types';
 import { log } from './logger.js';
+import { getObjectStorage, type StorageEnv } from './objectStorage.js';
 import { clearPlaybackPositionsForVideo } from './playbackPositions.js';
 
 interface PipelineEnv {
@@ -141,10 +142,50 @@ export async function handleVideoPipelineStatus(
       return jsonResponse({ error: 'Video not found', code: 'not_found' }, 404, corsHeaders);
     }
 
+    // HLS is live — the progressive raw source is no longer needed. Delete the
+    // object first; only then clear the key, so a failed delete stays retryable
+    // on a later callback (and preview_ready never touches it).
+    let clearRawKey = false;
+    if (stage === 'fully_processed') {
+      const rawRow = (await db
+        .prepare('SELECT raw_source_key FROM videos WHERE id = ?')
+        .bind(videoId)
+        .first()) as { raw_source_key?: string | null } | null;
+      if (rawRow?.raw_source_key) {
+        const storage = getObjectStorage(env as unknown as StorageEnv);
+        if (storage) {
+          try {
+            await storage.deleteObject(rawRow.raw_source_key);
+            clearRawKey = true;
+          } catch (e) {
+            log({
+              service: 'pipeline',
+              event: 'raw_source_cleanup_failed',
+              level: 'warn',
+              video_id: videoId,
+              detail: String(e),
+            });
+          }
+        } else {
+          log({
+            service: 'pipeline',
+            event: 'raw_source_cleanup_failed',
+            level: 'warn',
+            video_id: videoId,
+            detail: 'object storage not configured',
+          });
+        }
+      } else {
+        clearRawKey = true;
+      }
+    }
+
     await db
-      .prepare(`
-      UPDATE videos SET status = 'processed', updated_at = CURRENT_TIMESTAMP WHERE id = ?
-    `)
+      .prepare(
+        `UPDATE videos SET status = 'processed', updated_at = CURRENT_TIMESTAMP${
+          clearRawKey ? ', raw_source_key = NULL' : ''
+        } WHERE id = ?`,
+      )
       .bind(videoId)
       .run();
 
@@ -174,4 +215,50 @@ export async function handleVideoPipelineStatus(
       corsHeaders,
     );
   }
+}
+
+/**
+ * Scheduled sweep: a transient deleteObject failure inside the
+ * fully_processed callback leaves raw_source_key set on a processed row and
+ * the callback still returns 200 — nothing else retries it. Rows in flight
+ * (not processed, or updated in the last hour) are never touched.
+ */
+export async function sweepOrphanedRawSources(env: PipelineEnv): Promise<number> {
+  const db = getDb(env);
+  const { results } = await db
+    .prepare(
+      `SELECT id, raw_source_key FROM videos
+       WHERE raw_source_key IS NOT NULL AND status = 'processed'
+         AND updated_at <= datetime('now', '-1 hour')
+       LIMIT 25`,
+    )
+    .all<{ id: string; raw_source_key: string }>();
+  if (!results?.length) return 0;
+  const storage = getObjectStorage(env as unknown as StorageEnv);
+  if (!storage) return 0;
+  let cleaned = 0;
+  for (const row of results) {
+    try {
+      await storage.deleteObject(row.raw_source_key);
+      await db.prepare('UPDATE videos SET raw_source_key = NULL WHERE id = ?').bind(row.id).run();
+      cleaned += 1;
+    } catch (e) {
+      log({
+        service: 'pipeline',
+        event: 'raw_source_sweep_failed',
+        level: 'warn',
+        video_id: row.id,
+        detail: String(e),
+      });
+      // Push the failed row past the 1-hour window — without a backoff the
+      // same poison rows head the LIMIT 25 batch every sweep and starve
+      // later eligible rows forever.
+      await db
+        .prepare('UPDATE videos SET updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .bind(row.id)
+        .run()
+        .catch(() => {});
+    }
+  }
+  return cleaned;
 }

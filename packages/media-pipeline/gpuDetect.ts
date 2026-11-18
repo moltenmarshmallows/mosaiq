@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { access } from 'node:fs/promises';
+import { liveWorkerBackendCounts } from './workerRegistry.js';
 
 export type GpuBackend = 'cpu' | 'vaapi' | 'nvenc';
 
@@ -76,6 +77,7 @@ async function canUseNvenc(): Promise<boolean> {
   ]);
 }
 
+/** Probe THIS host's ffmpeg — used for local encodes (podcast preview renders). */
 export async function detectGpuEncodeConfig(): Promise<GpuEncodeConfig> {
   if (cached) return cached;
 
@@ -103,6 +105,39 @@ export async function detectGpuEncodeConfig(): Promise<GpuEncodeConfig> {
 
   cached = { backend: 'cpu', profileSuffix: '', vaapiDevice: VAAPI_DEVICE };
   return cached;
+}
+
+/**
+ * Backend to submit jobs for — driven by the live worker registry, not the
+ * coordinator's own hardware (Encore runs the job on whichever worker polls
+ * the queue; only the workers' capabilities matter).
+ *
+ * `VMP_GPU_BACKEND` overrides: `nvenc`/`vaapi` submit GPU profiles blindly
+ * (legacy force), `cpu`/`none` always CPU, `auto` asks the registry.
+ */
+export async function resolveSubmitBackend(): Promise<GpuBackend> {
+  if (FORCE_GPU === 'nvenc' || FORCE_GPU === 'nvidia') return 'nvenc';
+  if (FORCE_GPU === 'vaapi') return 'vaapi';
+  if (FORCE_GPU === 'cpu' || FORCE_GPU === 'none') return 'cpu';
+
+  const counts = await liveWorkerBackendCounts();
+  // shortcut: Encore exposes one GPU queue class — a vaapi-profile job pulled
+  // by an nvenc-only worker fails, so a mixed fleet cannot run GPU profiles
+  // safely. Fall back to CPU until dequeue can enforce backend compatibility.
+  if (counts.size > 1) {
+    process.stderr.write(
+      `[gpu-detect] mixed GPU fleet (${[...counts].map(([b, n]) => `${b}:${n}`).join(', ')}) — routing to CPU\n`,
+    );
+    return 'cpu';
+  }
+  const [backend] = counts.keys();
+  return backend ?? 'cpu';
+}
+
+export function gpuProfileSuffixFor(backend: GpuBackend): GpuEncodeConfig['profileSuffix'] {
+  if (backend === 'nvenc') return '-gpu-nvenc';
+  if (backend === 'vaapi') return '-gpu-vaapi';
+  return '';
 }
 
 export function resolveEncoreProfileBase(base: string, profileSuffix: string): string {

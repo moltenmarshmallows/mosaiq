@@ -21,7 +21,7 @@ function jsonResponse(data: any, status = 200, corsHeaders = {}) {
   });
 }
 
-async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+export async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     'raw',
     new TextEncoder().encode(secret),
