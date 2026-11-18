@@ -78,9 +78,12 @@ b2 bucket update "$B2_BUCKET_NAME" allPrivate \
 - `GET /metrics` on the supervisor — Prometheus exposition: queue depth, active jobs by stage, workers by backend, Encore/Redis health, last TTP, process stats.
 - Prometheus (scrape config in `observability/prometheus.yml`) + Grafana with a provisioned dashboard. `/metrics` requires `VMP_SUPERVISOR_DASHBOARD_SECRET` when set — create the token file first, then start detached:
   ```bash
-  # Read the value straight from .env — sourcing the file can break on values
-  # with spaces/quotes, and unset/empty must abort before writing the token.
-  secret=$(grep -E '^VMP_SUPERVISOR_DASHBOARD_SECRET=' .env | cut -d= -f2-)
+  # Resolve through Compose so quoting/escaping matches what the supervisor
+  # actually receives — a raw .env grep would write literal quotes into the
+  # token file when the value is dotenv-quoted.
+  secret=$(docker compose -f docker-compose.coordinator.yml --env-file .env config \
+    | sed -n 's/^ *VMP_SUPERVISOR_DASHBOARD_SECRET: *//p' | head -1)
+  secret=${secret%\"}; secret=${secret#\"}; secret=${secret%\'}; secret=${secret#\'}
   printf '%s' "${secret:?set VMP_SUPERVISOR_DASHBOARD_SECRET in .env first}" > observability/dashboard-token.txt
   docker compose -f docker-compose.coordinator.yml --env-file .env --profile observability up -d
   ```

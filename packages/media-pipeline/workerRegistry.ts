@@ -61,10 +61,6 @@ const REDIS_RETRY_COOLDOWN_MS = 30_000;
 const REDIS_CONNECT_DEADLINE_MS = 5000;
 const REDIS_SCAN_TIMEOUT_MS = 4000;
 
-// True when the last Redis SCAN was cut short — partial fleet data must never
-// drive backend-specific profile selection (conservative CPU fallback).
-let lastScanIncomplete = false;
-
 const memoryWorkers = new Map<string, WorkerRecord & { expiresAtMs: number }>();
 
 async function getRedis(): Promise<RegistryRedisClient | null> {
@@ -150,8 +146,15 @@ export async function recordWorkerHeartbeat(
   return record;
 }
 
-export async function listWorkers(): Promise<WorkerRecord[]> {
+async function listWorkersDetailed(): Promise<{
+  workers: WorkerRecord[];
+  scanComplete: boolean;
+}> {
   const seen = new Map<string, WorkerRecord>();
+  // Memory-only counts as complete: when Redis is down the in-process table IS
+  // the registry of record for this supervisor. Only a truncated SCAN means
+  // partial data.
+  let scanComplete = true;
   const client = await getRedis();
   if (client) {
     // connectTimeout only bounds the handshake — a half-dead socket can hang a
@@ -172,9 +175,8 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
           if (record?.workerId) seen.set(record.workerId, record);
         }
       }
-      lastScanIncomplete = false;
     } catch {
-      lastScanIncomplete = true;
+      scanComplete = false;
       /* fall through to memory */
     } finally {
       clearTimeout(deadline);
@@ -195,7 +197,14 @@ export async function listWorkers(): Promise<WorkerRecord[]> {
       seen.set(id, record);
     }
   }
-  return [...seen.values()].filter((r) => isWorkerAlive(r, nowMs));
+  return {
+    workers: [...seen.values()].filter((r) => isWorkerAlive(r, nowMs)),
+    scanComplete,
+  };
+}
+
+export async function listWorkers(): Promise<WorkerRecord[]> {
+  return (await listWorkersDetailed()).workers;
 }
 
 /** Redis reachability for /metrics + health reporting. */
@@ -224,9 +233,11 @@ export async function liveWorkerBackendCounts(): Promise<Map<WorkerGpuBackend, n
   // A truncated SCAN under-counts a backend that is actually present — a
   // backend-specific profile could then route to a fleet that can't run it.
   // Report nothing until a full scan succeeds; resolveSubmitBackend falls
-  // back to CPU (the queue every worker polls).
-  if (lastScanIncomplete) return counts;
-  for (const worker of await listWorkers()) {
+  // back to CPU (the queue every worker polls). Completeness travels with
+  // this listing — concurrent scans can't clobber each other's status.
+  const { workers, scanComplete } = await listWorkersDetailed();
+  if (!scanComplete) return counts;
+  for (const worker of workers) {
     if (worker.gpuBackend === 'cpu') continue;
     // Only workers that can claim queue 0 count as GPU capacity: a worker
     // pinned to queue 1 without higher-prio polling never drains prio>=50

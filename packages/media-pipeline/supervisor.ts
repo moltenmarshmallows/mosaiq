@@ -660,16 +660,19 @@ async function recordTusPublished(uploadId: string, destBasename: string): Promi
     const dir = tusPublishedDir();
     await fs.promises.mkdir(dir, { recursive: true });
     await fs.promises.writeFile(tusPublishedPath(uploadId), destBasename, 'utf8');
-    // Bound tombstone growth — FIFO sweep of the oldest entries.
+    // Bound tombstone growth — FIFO sweep of the oldest entries. Stat every
+    // entry before choosing victims; slicing readdir's arbitrary order first
+    // could spare genuinely-oldest tombstones.
     const entries = (await fs.promises.readdir(dir)).filter((e) => e !== '.' && e !== '..');
     if (entries.length > TUS_PUBLISHED_LIMIT) {
-      const stats = await Promise.all(
-        entries.slice(0, entries.length - TUS_PUBLISHED_LIMIT).map(async (e) => ({
-          name: e,
-          mtime: (await fs.promises.stat(path.join(dir, e))).mtimeMs,
-        })),
-      );
-      stats.sort((a, b) => a.mtime - b.mtime);
+      const stats = (
+        await Promise.all(
+          entries.map(async (e) => ({
+            name: e,
+            mtime: (await fs.promises.stat(path.join(dir, e)).catch(() => null))?.mtimeMs ?? 0,
+          })),
+        )
+      ).sort((a, b) => a.mtime - b.mtime);
       for (const s of stats.slice(0, entries.length - TUS_PUBLISHED_LIMIT)) {
         await fs.promises.rm(path.join(dir, s.name), { force: true }).catch(() => {});
       }

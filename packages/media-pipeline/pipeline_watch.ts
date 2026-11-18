@@ -959,7 +959,10 @@ async function startIpcServer(): Promise<void> {
   if (existsSync(ipcSocketPath)) {
     await unlink(ipcSocketPath);
   }
-  ipcServer = net.createServer((socket) => {
+  // allowHalfOpen: the supervisor client.end()s its command then reads the
+  // reply — without this the socket auto-closes our writable side on 'end',
+  // and a reply built after an awaited intake would never arrive.
+  ipcServer = net.createServer({ allowHalfOpen: true }, (socket) => {
     let buf = '';
     socket.on('data', (chunk) => {
       buf += chunk.toString();
@@ -1117,17 +1120,21 @@ async function startupScan(): Promise<void> {
   for (const watch of INBOX_WATCHES) {
     await mkdir(watch.dir, { recursive: true });
     const entries = await readdir(watch.dir);
-    for (const file of entries) {
-      // One still-growing file must not abort startup — it stays eligible for
-      // the next event or rescan.
-      try {
-        await intakeInboxBasename(file, watch.dir, watch.pipelineMode, 'startup_scan', true);
-      } catch (err) {
-        log(
-          `startup_scan skipped '${file}' (${watch.dir}): ${err instanceof Error ? err.message : String(err)}`,
-        );
+    // Route through the shared scheduler — one still-growing file's stability
+    // wait must not serially block every other entry, and dedupe must cover
+    // files a watcher event already claimed during the scan.
+    const settled = await Promise.allSettled(
+      entries.map((file) =>
+        scheduleInboxIntake(file, watch.dir, watch.pipelineMode, 'startup_scan', true),
+      ),
+    );
+    settled.forEach((outcome, i) => {
+      if (outcome.status === 'rejected' || outcome.value === false) {
+        const reason =
+          outcome.status === 'rejected' ? outcome.reason : 'intake not accepted';
+        log(`startup_scan skipped '${entries[i]}' (${watch.dir}): ${String(reason)}`);
       }
-    }
+    });
   }
   if (queue.length > 0 || running > 0) {
     log(`📋 startup_scan queued ${queue.length} job(s) (${running} already running)`);
@@ -1276,9 +1283,6 @@ async function main() {
     );
     poller = startPollingWatcher();
   }
-  log('🔍 Resuming existing jobs...');
-  await startupScan();
-
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -1292,12 +1296,16 @@ async function main() {
     await stopIpcServer();
     log('Shutting down pipeline watcher');
   };
+  // Register before the scan — a stability wait inside startupScan can hold
+  // startup for a long time and a SIGTERM must still shut down cleanly.
   process.on('SIGTERM', () => {
     void shutdown();
   });
   process.on('SIGINT', () => {
     void shutdown();
   });
+  log('🔍 Resuming existing jobs...');
+  await startupScan();
 }
 
 main().catch((err) => {

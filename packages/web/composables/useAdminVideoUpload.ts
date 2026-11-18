@@ -44,8 +44,17 @@ export function useAdminVideoUpload(
     `${LS_PREFIX}${apiUrl}:${file.name}:${file.size}:${file.lastModified}`;
 
   /** Full-file content check: hash-of-hashes over 8MB chunks so a same-named
-   *  different file can never resume into the wrong session. */
-  const fingerprint = async (file: File): Promise<string> => {
+   *  different file can never resume into the wrong session. Cached per File —
+   *  loadSession + resume hash the same pick repeatedly otherwise. */
+  const fingerprintCache = new WeakMap<File, Promise<string>>();
+  const fingerprint = (file: File): Promise<string> => {
+    const cached = fingerprintCache.get(file);
+    if (cached) return cached;
+    const pending = computeFingerprint(file);
+    fingerprintCache.set(file, pending);
+    return pending;
+  };
+  const computeFingerprint = async (file: File): Promise<string> => {
     try {
       const chunkSize = 8 * 1024 * 1024;
       const hashes: Uint8Array[] = [];
@@ -58,7 +67,7 @@ export function useAdminVideoUpload(
       }
       const sizeBytes = new TextEncoder().encode(String(file.size));
       const buf = new Uint8Array(hashes.length * 32 + sizeBytes.byteLength);
-      hashes.forEach((h, i) => buf.set(h, i * 32));
+      for (const [i, h] of hashes.entries()) buf.set(h, i * 32);
       buf.set(sizeBytes, hashes.length * 32);
       const digest = await crypto.subtle.digest('SHA-256', buf);
       return Array.from(new Uint8Array(digest).subarray(0, 8), (b) =>
@@ -227,13 +236,21 @@ export function useAdminVideoUpload(
         }
       };
 
-      // Simple worker-pool over part numbers.
+      // Simple worker-pool over part numbers. poolFailed stops idle workers
+      // from claiming new parts once one rejects — already-started uploads
+      // finish, the first rejection still propagates.
+      let poolFailed = false;
       const pending: number[] = [];
       for (let n = 1; n <= partCount; n++) if (!done.has(n)) pending.push(n);
       await Promise.all(
         Array.from({ length: Math.min(CONCURRENCY, pending.length) }, async () => {
-          for (let n = pending.pop(); n !== undefined; n = pending.pop()) {
-            await uploadPart(n);
+          for (let n = pending.pop(); n !== undefined && !poolFailed; n = pending.pop()) {
+            try {
+              await uploadPart(n);
+            } catch (err) {
+              poolFailed = true;
+              throw err;
+            }
           }
         }),
       );
@@ -256,6 +273,13 @@ export function useAdminVideoUpload(
         // transient/uncertain outcomes keep the saved parts for resume.
         const e = err as Error & { status?: number; code?: string };
         if (e.status === 404 || e.code === 'not_found') clearSession(file);
+        // Upload committed, only the encoder notification failed — that is a
+        // done-state with a retryable ingest, not an upload error.
+        if (e.status === 502 && typeof e.code === 'string' && e.code.startsWith('ingest_')) {
+          clearSession(file);
+          progress.value = { ...progress.value, state: 'done', bytesSent: file.size };
+          return { videoId: s.videoId, ingestDelivered: false };
+        }
         throw err;
       }
       clearSession(file);

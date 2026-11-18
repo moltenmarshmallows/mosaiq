@@ -88,10 +88,22 @@ export function planIngest(
       'sourceUrl origin must match VMP_API_BASE_URL',
     );
   }
-  const objectPath = source.pathname.startsWith(PROXY_PREFIX)
-    ? decodeURIComponent(source.pathname.slice(PROXY_PREFIX.length))
-    : '';
-  if (!objectPath.startsWith(`videos/${videoId}/`) || !SAFE_EXT.test(objectPath)) {
+  let objectPath = '';
+  if (source.pathname.startsWith(PROXY_PREFIX)) {
+    try {
+      objectPath = decodeURIComponent(source.pathname.slice(PROXY_PREFIX.length));
+    } catch {
+      // Malformed % sequences must fail as a key error, not a raw URIError.
+      throw new IngestPlanError('invalid_source_key', 'sourceUrl path is not valid percent-encoding');
+    }
+  }
+  // '.'/'..' segments would normalize server-side into other videos' keys —
+  // the proxy resolves them, so reject before we ever fetch.
+  if (
+    !objectPath.startsWith(`videos/${videoId}/`) ||
+    !SAFE_EXT.test(objectPath) ||
+    objectPath.split('/').some((seg) => seg === '.' || seg === '..')
+  ) {
     throw new IngestPlanError(
       'invalid_source_key',
       `sourceUrl must resolve to videos/${videoId}/source.{mp4,mov,mkv}`,

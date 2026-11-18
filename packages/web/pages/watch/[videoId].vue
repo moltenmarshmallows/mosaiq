@@ -2470,6 +2470,20 @@
           videoData.value?.videoId ?? targetVideoId,
           guard,
         );
+      } else if (!rateLimited.value) {
+        // No playable source yet — still encoding, or the raw container is one
+        // this browser can't decode. Stop whatever the previous video left
+        // running instead of leaving it playing under the new page.
+        const stale = getPlaybackVideo();
+        if (stale) {
+          stale.pause();
+          stale.removeAttribute('src');
+          stale.load();
+        }
+        teardownVideoListeners();
+        error.value = null;
+        playbackUnavailable.value = true;
+        void loadBrowseRecommendations(options.signal);
       }
       await recommendationsPromise.catch(() => undefined);
     } catch (e: any) {
