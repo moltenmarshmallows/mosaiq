@@ -3633,11 +3633,13 @@ async function handleAdminVideoDelete(request: any, env: any, corsHeaders: any) 
 
     // offline_download_licenses references videos without ON DELETE CASCADE — clear it
     // first; the table may be absent on DBs that never ran migration 0037.
-    const hasLicenseTable = await db
-      .prepare(
-        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'offline_download_licenses'`,
-      )
-      .first();
+    // Dialect-neutral existence check (works on D1 and the Postgres D1 shim).
+    let hasLicenseTable = true;
+    try {
+      await db.prepare(`SELECT 1 FROM offline_download_licenses LIMIT 1`).first();
+    } catch {
+      hasLicenseTable = false;
+    }
     await db.batch([
       ...(hasLicenseTable
         ? [

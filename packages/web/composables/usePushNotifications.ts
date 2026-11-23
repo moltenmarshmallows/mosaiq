@@ -111,6 +111,20 @@ export function usePushNotifications() {
         return;
       }
 
+      // A subscription bound to a rotated VAPID key can't receive pushes — drop
+      // it and report unsubscribed instead of re-posting a dead subscription.
+      const configuredKey = await _getVapidPublicKey().catch(() => null);
+      const existingKey = sub.options?.applicationServerKey;
+      if (
+        configuredKey &&
+        existingKey &&
+        !_arrayBufferEquals(existingKey, _urlB64ToUint8Array(configuredKey))
+      ) {
+        await sub.unsubscribe().catch(() => {});
+        isSubscribed.value = false;
+        return;
+      }
+
       // If the user is logged in, re-POST the existing subscription so the server
       // associates it with the correct account (handles same-device login switch).
       if (isLoggedIn.value) {
