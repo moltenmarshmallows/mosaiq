@@ -78,6 +78,11 @@ export function usePushNotifications() {
     return Uint8Array.from(rawData, (c) => c.charCodeAt(0));
   }
 
+  function _arrayBufferEquals(a: ArrayBuffer, b: Uint8Array): boolean {
+    const ua = new Uint8Array(a);
+    return ua.length === b.length && ua.every((v, i) => v === b[i]);
+  }
+
   async function _getServiceWorkerRegistration(): Promise<ServiceWorkerRegistration> {
     const existing = await navigator.serviceWorker.getRegistration();
     if (existing) return existing;
@@ -165,10 +170,18 @@ export function usePushNotifications() {
     const existingSubscription = await reg.pushManager.getSubscription();
     // Holder so TypeScript tracks mutations across the nested `doSubscribe` closure.
     const browserSub = { current: existingSubscription as PushSubscription | null };
+    const applicationServerKey = _urlB64ToUint8Array(vapidPublicKey);
+
+    // A subscription bound to an older VAPID public key can't receive pushes —
+    // drop it so subscribe() creates a fresh one against the current key.
+    const existingKey = existingSubscription?.options?.applicationServerKey;
+    if (existingSubscription && existingKey && !_arrayBufferEquals(existingKey, applicationServerKey)) {
+      await existingSubscription.unsubscribe().catch(() => {});
+      browserSub.current = null;
+    }
 
     async function doSubscribe(): Promise<void> {
       if (!browserSub.current) {
-        const applicationServerKey = _urlB64ToUint8Array(vapidPublicKey);
         browserSub.current = await reg.pushManager.subscribe({
           userVisibleOnly: true,
           applicationServerKey: applicationServerKey.buffer as ArrayBuffer,

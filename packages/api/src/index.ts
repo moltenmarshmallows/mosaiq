@@ -3631,11 +3631,23 @@ async function handleAdminVideoDelete(request: any, env: any, corsHeaders: any) 
       }
     }
 
-    // offline_download_licenses references videos without ON DELETE CASCADE — clear it first
-    await db.prepare(`DELETE FROM offline_download_licenses WHERE video_id = ?`).bind(videoId).run();
-
-    // Delete the D1 row
-    await db.prepare(`DELETE FROM videos WHERE id = ?`).bind(videoId).run();
+    // offline_download_licenses references videos without ON DELETE CASCADE — clear it
+    // first; the table may be absent on DBs that never ran migration 0037.
+    const hasLicenseTable = await db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'offline_download_licenses'`,
+      )
+      .first();
+    await db.batch([
+      ...(hasLicenseTable
+        ? [
+            db
+              .prepare(`DELETE FROM offline_download_licenses WHERE video_id = ?`)
+              .bind(videoId),
+          ]
+        : []),
+      db.prepare(`DELETE FROM videos WHERE id = ?`).bind(videoId),
+    ]);
 
     try {
       await syncScheduledPublishHint(env);
