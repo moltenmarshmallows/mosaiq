@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Slim auditable billing Worker — PaymentMiddleware, PSPs, webhooks, renewals",
+  "description": "Slim auditable billing Worker \u2014 PaymentMiddleware, PSPs, webhooks, renewals",
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -15,6 +15,7 @@
     "test": "tsx --test ./test/*.test.ts"
   },
   "dependencies": {
+    "@aws-sdk/xml-builder": "^3.972.40",
     "@vmp/payments": "*",
     "@vmp/shared": "*",
     "@vmp/storage": "*",

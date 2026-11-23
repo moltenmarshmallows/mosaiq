@@ -3631,6 +3631,9 @@ async function handleAdminVideoDelete(request: any, env: any, corsHeaders: any) 
       }
     }
 
+    // offline_download_licenses references videos without ON DELETE CASCADE — clear it first
+    await db.prepare(`DELETE FROM offline_download_licenses WHERE video_id = ?`).bind(videoId).run();
+
     // Delete the D1 row
     await db.prepare(`DELETE FROM videos WHERE id = ?`).bind(videoId).run();
 

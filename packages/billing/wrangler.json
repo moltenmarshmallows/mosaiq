@@ -1,6 +1,9 @@
 {
   "name": "vmp-billing",
   "main": "src/index.ts",
+  "alias": {
+    "@aws-sdk/xml-builder": "@aws-sdk/xml-builder/dist-cjs/index.js"
+  },
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],
   "d1_databases": [
