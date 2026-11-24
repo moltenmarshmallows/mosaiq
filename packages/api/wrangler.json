@@ -1,6 +1,9 @@
 {
   "name": "vmp-api-staging",
   "main": "src/index.ts",
+  "alias": {
+    "@aws-sdk/xml-builder": "@aws-sdk/xml-builder/dist-cjs/index.js"
+  },
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],
   "version_metadata": {
@@ -77,7 +80,7 @@
     "ALLOWED_ORIGINS": "https://app.mosaiq.video,https://staging.app.mosaiq.video,https://www.mosaiq.video,https://mosaiq.video,http://localhost:3000",
     "POSTHOG_HOST": "https://eu.i.posthog.com",
     "STRIPE_PUBLISHABLE_KEY": "pk_test_51RdewjRPCqIWzqvdZ2NnLW1fib03Ql8OAYeGToQiuX0s0mODyl40swBO0WTdA9M3ZwL6HpMdqf0Ei8Twem72k1Xe00Pv948Qds",
-    "VAPID_PUBLIC_KEY": "BNb3xGO1WgZozFD9h4Px9qBYICqXD_3x9GXzmVCnqmcdwpJF8vBdlC2mM5taUyonUrP2YpUNdw0Wf282zx4Pirw"
+    "VAPID_PUBLIC_KEY": "BOL4mEhin7jaoS2iL4rOFhvLuuiR-IjDSH3i9SoikksbmMrheQbLuvjrD4sc9Pc419wO2C0nPPBQLQpPRxGU8PI"
   },
   "observability": {
     "logs": {
@@ -169,7 +172,7 @@
         "ALLOWED_ORIGINS": "https://app.mosaiq.video,https://staging.app.mosaiq.video,https://www.mosaiq.video,https://mosaiq.video",
         "POSTHOG_HOST": "https://eu.i.posthog.com",
         "STRIPE_PUBLISHABLE_KEY": "pk_test_51RdewjRPCqIWzqvdZ2NnLW1fib03Ql8OAYeGToQiuX0s0mODyl40swBO0WTdA9M3ZwL6HpMdqf0Ei8Twem72k1Xe00Pv948Qds",
-        "VAPID_PUBLIC_KEY": "BNb3xGO1WgZozFD9h4Px9qBYICqXD_3x9GXzmVCnqmcdwpJF8vBdlC2mM5taUyonUrP2YpUNdw0Wf282zx4Pirw"
+        "VAPID_PUBLIC_KEY": "BOL4mEhin7jaoS2iL4rOFhvLuuiR-IjDSH3i9SoikksbmMrheQbLuvjrD4sc9Pc419wO2C0nPPBQLQpPRxGU8PI"
       },
       "observability": {
         "logs": {

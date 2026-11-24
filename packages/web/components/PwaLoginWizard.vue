@@ -235,11 +235,21 @@
       const { publicKey } = (await vapidRes.json()) as { publicKey: string };
 
       const reg = await getServiceWorkerRegistration();
+      const applicationServerKey = urlB64ToUint8Array(publicKey);
       let sub = await reg.pushManager.getSubscription();
+      // Drop a subscription bound to an older VAPID key — it can't receive pushes.
+      const existingKey = sub?.options?.applicationServerKey;
+      if (sub && existingKey) {
+        const ka = new Uint8Array(existingKey);
+        if (ka.length !== applicationServerKey.length || ka.some((v, i) => v !== applicationServerKey[i])) {
+          await sub.unsubscribe().catch(() => {});
+          sub = null;
+        }
+      }
       if (!sub) {
         sub = await reg.pushManager.subscribe({
           userVisibleOnly: true,
-          applicationServerKey: urlB64ToUint8Array(publicKey).buffer as ArrayBuffer,
+          applicationServerKey: applicationServerKey.buffer as ArrayBuffer,
         });
       }
 
