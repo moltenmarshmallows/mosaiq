@@ -18,6 +18,9 @@ const permission = ref<NotificationPermission>('default');
 const pushError = ref<string | null>(null);
 const _initialised = ref(false);
 let _watcherRegistered = false;
+// Bumped by subscribe()/unsubscribe()/user-change — a _reconcile() that started
+// in an older generation must not overwrite their state (or unsubscribe a fresh sub).
+let _lifecycleGeneration = 0;
 
 export function usePushNotifications() {
   const { authHeader, isLoggedIn, user } = useAuth();
@@ -101,11 +104,14 @@ export function usePushNotifications() {
    * Called on first mount and whenever the signed-in user changes.
    */
   async function _reconcile() {
+    const gen = _lifecycleGeneration;
+    const stale = () => gen !== _lifecycleGeneration;
     try {
       if (!isSupported.value) return;
       permission.value = Notification.permission;
 
       const sub = await _getCurrentSubscription();
+      if (stale()) return;
       if (!sub) {
         isSubscribed.value = false;
         return;
@@ -114,6 +120,7 @@ export function usePushNotifications() {
       // A subscription bound to a rotated VAPID key can't receive pushes — drop
       // it and report unsubscribed instead of re-posting a dead subscription.
       const configuredKey = await _getVapidPublicKey().catch(() => null);
+      if (stale()) return;
       const existingKey = sub.options?.applicationServerKey;
       if (
         configuredKey &&
@@ -137,6 +144,7 @@ export function usePushNotifications() {
             keys: { p256dh: subJson.keys?.p256dh, auth: subJson.keys?.auth },
           }),
         }).catch(() => null);
+        if (stale()) return;
 
         if (res && res.ok) {
           isSubscribed.value = true;
@@ -154,6 +162,7 @@ export function usePushNotifications() {
 
   /** Request push permission and register with the backend */
   async function subscribe(): Promise<void> {
+    _lifecycleGeneration++;
     pushError.value = null;
     if (!isSupported.value) return;
     if (!isLoggedIn.value) {
@@ -267,6 +276,7 @@ export function usePushNotifications() {
 
   /** Unsubscribe from push notifications */
   async function unsubscribe(): Promise<void> {
+    _lifecycleGeneration++;
     pushError.value = null;
     const pushSub = await _getCurrentSubscription();
     if (!pushSub) {
@@ -313,6 +323,7 @@ export function usePushNotifications() {
       (newId, oldId) => {
         if (newId !== oldId) {
           // User changed (including first login) — reset then reconcile
+          _lifecycleGeneration++;
           isSubscribed.value = false;
           pushError.value = null;
           void _reconcile();
