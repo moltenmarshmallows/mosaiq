@@ -3631,8 +3631,25 @@ async function handleAdminVideoDelete(request: any, env: any, corsHeaders: any) 
       }
     }
 
-    // Delete the D1 row
-    await db.prepare(`DELETE FROM videos WHERE id = ?`).bind(videoId).run();
+    // offline_download_licenses references videos without ON DELETE CASCADE — clear it
+    // first; the table may be absent on DBs that never ran migration 0037.
+    // Dialect-neutral existence check (works on D1 and the Postgres D1 shim).
+    let hasLicenseTable = true;
+    try {
+      await db.prepare(`SELECT 1 FROM offline_download_licenses LIMIT 1`).first();
+    } catch {
+      hasLicenseTable = false;
+    }
+    await db.batch([
+      ...(hasLicenseTable
+        ? [
+            db
+              .prepare(`DELETE FROM offline_download_licenses WHERE video_id = ?`)
+              .bind(videoId),
+          ]
+        : []),
+      db.prepare(`DELETE FROM videos WHERE id = ?`).bind(videoId),
+    ]);
 
     try {
       await syncScheduledPublishHint(env);
