@@ -1259,7 +1259,7 @@ function dashboardHtml() {
       return html
     }
     function jobControls(j) {
-      if (!['queued', 'running', 'paused'].includes(j.status)) return ''
+      if (!['queued', 'running', 'active', 'paused'].includes(j.status)) return ''
       const vid = escapeHtml(j.videoId || '')
       const paused = j.status === 'paused'
       const btns = []
