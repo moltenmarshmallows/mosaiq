@@ -242,8 +242,8 @@ export function encoreJobUrl(jobId: string): string {
 
 const PROFILE_GPU_VARIANTS: Record<string, string[]> = {
   'vmp-720p-audio': ['vmp-720p-audio-gpu-nvenc', 'vmp-720p-audio-gpu-vaapi', 'vmp-720p-audio'],
-  'vmp-1080p': ['vmp-1080p'],
-  'vmp-480p': ['vmp-480p'],
+  'vmp-1080p': ['vmp-1080p-gpu-nvenc', 'vmp-1080p-gpu-vaapi', 'vmp-1080p'],
+  'vmp-480p': ['vmp-480p-gpu-nvenc', 'vmp-480p-gpu-vaapi', 'vmp-480p'],
   'vmp-full-ladder': ['vmp-full-ladder-gpu-nvenc', 'vmp-full-ladder-gpu-vaapi', 'vmp-full-ladder'],
   'vmp-podcast-mp3': ['vmp-podcast-mp3'],
   'vmp-podcast-preview': ['vmp-podcast-preview'],
