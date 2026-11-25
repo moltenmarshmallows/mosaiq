@@ -71,10 +71,12 @@ echo "worker=$WORKER_ID backend=$GPU_BACKEND pollQueue=$ENCORE_SETTINGS_POLL_QUE
 heartbeat_loop() {
   [ -n "${VMP_WORKER_TOKEN:-}" ] || { echo "heartbeat: VMP_WORKER_TOKEN unset — not registering" >&2; return; }
   while true; do
-    # Register only while an encore-worker process is alive — a worker that
-    # fails at startup must not advertise GPU capacity it cannot use. The
-    # registry TTL drops us once heartbeats stop.
-    if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
+    # Register while an encore-worker process is alive OR right after a clean
+    # exit — the stock worker is one-shot (exits when the queue drains), so
+    # alive-only gating skips nearly every heartbeat while idle. A worker that
+    # fails at startup exits non-zero and never writes WORKER_OK_FILE.
+    if { [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; } \
+      || [ -f "$WORKER_OK_FILE" ]; then
       # jq-encoded — a quote/backslash in WORKER_ID or VMP_WORKER_VERSION must
       # not break the JSON body (or inject fields).
       payload=$(jq -cn \
@@ -96,6 +98,7 @@ heartbeat_loop() {
 }
 
 WORKER_PID_FILE="${WORKER_PID_FILE:-/tmp/encore-worker.pid}"
+WORKER_OK_FILE="${WORKER_OK_FILE:-/tmp/encore-worker.ok}"
 heartbeat_loop &
 
 worker_pid=""
@@ -114,6 +117,8 @@ while true; do
   code=$?
   worker_pid=""
   rm -f "$WORKER_PID_FILE"
+  # Clean drain-exit → stay registered; crash loop → drop out of the registry.
+  if [ "$code" -eq 0 ]; then touch "$WORKER_OK_FILE"; else rm -f "$WORKER_OK_FILE"; fi
   set -e
   echo "worker exited $code; restart in ${IDLE_SLEEP}s" >&2
   sleep "$IDLE_SLEEP"
