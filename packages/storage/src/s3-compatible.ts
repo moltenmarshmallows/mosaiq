@@ -124,6 +124,10 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
         ...(options.endpoint ? { endpoint: options.endpoint } : {}),
         ...(options.forcePathStyle ? { forcePathStyle: true } : {}),
         ...(credentials ? { credentials } : {}),
+        // SDK v3 defaults checksums to WHEN_SUPPORTED; B2 rejects
+        // x-amz-checksum-* headers on CompleteMultipartUpload.
+        requestChecksumCalculation: 'WHEN_REQUIRED',
+        responseChecksumValidation: 'WHEN_REQUIRED',
         requestHandler:
           options.requestHandler ?? createDefaultRequestHandler(options.requestTimeoutMs),
       });

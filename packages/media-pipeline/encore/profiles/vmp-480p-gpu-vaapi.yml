@@ -1,0 +1,19 @@
+name: vmp-480p-gpu-vaapi
+description: VMP phase-2 — 480p H.264 via VAAPI (worker GPU required)
+scaling: bicubic
+encodes:
+  - type: X264Encode
+    suffix: _480p
+    height: 480
+    twoPass: false
+    videoFilter: format=nv12,hwupload
+    params:
+      c:v: h264_vaapi
+      b:v: 1500k
+      maxrate: 1500k
+      bufsize: 3000k
+      r: 30
+      g: 60
+      keyint_min: 60
+      sc_threshold: 0
+      profile:v: main
