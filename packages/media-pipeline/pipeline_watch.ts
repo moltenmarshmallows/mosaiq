@@ -416,6 +416,12 @@ function isEnoent(err: unknown): boolean {
 }
 
 async function waitStableSize(filePath: string): Promise<void> {
+  // A stable file must still be able to complete when the configured timeout
+  // is shorter than IDLE_POLLS×POLL_MS — bound the idle window by the timeout.
+  const neededIdlePolls = Math.min(
+    WAIT_STABLE_IDLE_POLLS,
+    Math.max(1, Math.floor(WAIT_STABLE_TIMEOUT_MS / WAIT_STABLE_POLL_MS)),
+  );
   let prev = -1;
   let idlePolls = 0;
   const startedAt = Date.now();
@@ -423,7 +429,7 @@ async function waitStableSize(filePath: string): Promise<void> {
     const s = (await stat(filePath)).size;
     if (s === prev) {
       idlePolls += 1;
-      if (idlePolls >= WAIT_STABLE_IDLE_POLLS) return;
+      if (idlePolls >= neededIdlePolls) return;
     } else {
       idlePolls = 0;
     }
@@ -576,6 +582,8 @@ async function completePipelineSuccess(
   progressEmitState.delete(videoId);
   jobHandles.delete(videoId);
   stoppedVideos.delete(videoId);
+  // The input is gone — a same-name/id re-drop must be allowed through again.
+  enqueuedVideoIds.delete(videoId);
 }
 
 function isPidAlive(pid: number): boolean {
@@ -839,8 +847,13 @@ async function intakeInboxBasename(
 
   const cachedByFile = inboxIntakeByBasename.get(cacheKey);
   if (cachedByFile) {
-    maybeEnqueueOnce(cachedByFile.videoId, cachedByFile.targetPath, source, pipelineMode);
-    return;
+    // The processed input is deleted on success — a stale entry must not route
+    // a new same-named drop to the completed (now missing) target.
+    if (existsSync(cachedByFile.targetPath)) {
+      maybeEnqueueOnce(cachedByFile.videoId, cachedByFile.targetPath, source, pipelineMode);
+      return;
+    }
+    inboxIntakeByBasename.delete(cacheKey);
   }
 
   const stem = file.replace(/\.[^.]+$/, '');
