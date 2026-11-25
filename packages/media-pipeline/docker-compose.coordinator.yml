@@ -38,10 +38,20 @@ services:
     environment:
       VMP_REDIS_PASSWORD: ${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD in .env}
     # requirepass is mandatory: remote workers reach this port over LAN.
+    # Coordinator targets amd64/arm64 — arm32 image variants exist but the
+    # bundled modules are untested there.
+    # Must invoke redis-server directly: the image entrypoint only appends
+    # --loadmodule for the bundled modules (RediSearch, which encore-web needs
+    # at boot via FT.*) when argv[0] is redis-server — an `sh -c` wrapper
+    # silently skips module loading.
     command:
-      - sh
-      - -c
-      - exec redis-server --appendonly yes --requirepass "$${VMP_REDIS_PASSWORD}"
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--requirepass",
+        "${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD in .env}",
+      ]
     volumes:
       - redis-data:/data
     ports:
