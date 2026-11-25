@@ -1281,10 +1281,14 @@ async function main() {
     );
   } catch (err) {
     log(
-      `⚠️ inotify unavailable, falling back to polling: ${err instanceof Error ? err.message : String(err)}`,
+      `⚠️ inotify unavailable: ${err instanceof Error ? err.message : String(err)}`,
     );
-    poller = startPollingWatcher();
   }
+  // Poll regardless: inotify never fires for files written over an NFS mount,
+  // so an NFS inbox would silently drop every upload. Intake already dedupes
+  // concurrent event/poll/scan claims on the same basename.
+  poller = startPollingWatcher();
+  log('✅ polling watcher started (2s interval — covers NFS inboxes)');
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
