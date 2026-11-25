@@ -85,9 +85,13 @@ const WAIT_STABLE_POLL_MS = Math.max(
   250,
   Number.parseInt(process.env.WAIT_STABLE_POLL_MS || '2000', 10) || 2000,
 );
+// Size-only stability is all a poll can prove — on NFS there is no close_write
+// signal and no way to see remote writers' open files. 3 idle polls (~6s)
+// narrows the paused-writer window; the airtight path for writers is to stage
+// the file and `mv` it into the inbox (atomic publish).
 const WAIT_STABLE_IDLE_POLLS = Math.max(
   1,
-  Number.parseInt(process.env.WAIT_STABLE_IDLE_POLLS || '1', 10) || 1,
+  Number.parseInt(process.env.WAIT_STABLE_IDLE_POLLS || '3', 10) || 3,
 );
 const VMP_API_BASE_URL = (process.env.VMP_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const VMP_API_PIPELINE_SECRET = (process.env.VMP_API_PIPELINE_SECRET || '').trim();
@@ -412,6 +416,12 @@ function isEnoent(err: unknown): boolean {
 }
 
 async function waitStableSize(filePath: string): Promise<void> {
+  // A stable file must still be able to complete when the configured timeout
+  // is shorter than IDLE_POLLS×POLL_MS — bound the idle window by the timeout.
+  const neededIdlePolls = Math.min(
+    WAIT_STABLE_IDLE_POLLS,
+    Math.max(1, Math.floor(WAIT_STABLE_TIMEOUT_MS / WAIT_STABLE_POLL_MS)),
+  );
   let prev = -1;
   let idlePolls = 0;
   const startedAt = Date.now();
@@ -419,7 +429,7 @@ async function waitStableSize(filePath: string): Promise<void> {
     const s = (await stat(filePath)).size;
     if (s === prev) {
       idlePolls += 1;
-      if (idlePolls >= WAIT_STABLE_IDLE_POLLS) return;
+      if (idlePolls >= neededIdlePolls) return;
     } else {
       idlePolls = 0;
     }
@@ -572,6 +582,8 @@ async function completePipelineSuccess(
   progressEmitState.delete(videoId);
   jobHandles.delete(videoId);
   stoppedVideos.delete(videoId);
+  // The input is gone — a same-name/id re-drop must be allowed through again.
+  enqueuedVideoIds.delete(videoId);
 }
 
 function isPidAlive(pid: number): boolean {
@@ -835,8 +847,13 @@ async function intakeInboxBasename(
 
   const cachedByFile = inboxIntakeByBasename.get(cacheKey);
   if (cachedByFile) {
-    maybeEnqueueOnce(cachedByFile.videoId, cachedByFile.targetPath, source, pipelineMode);
-    return;
+    // The processed input is deleted on success — a stale entry must not route
+    // a new same-named drop to the completed (now missing) target.
+    if (existsSync(cachedByFile.targetPath)) {
+      maybeEnqueueOnce(cachedByFile.videoId, cachedByFile.targetPath, source, pipelineMode);
+      return;
+    }
+    inboxIntakeByBasename.delete(cacheKey);
   }
 
   const stem = file.replace(/\.[^.]+$/, '');
@@ -1281,10 +1298,14 @@ async function main() {
     );
   } catch (err) {
     log(
-      `⚠️ inotify unavailable, falling back to polling: ${err instanceof Error ? err.message : String(err)}`,
+      `⚠️ inotify unavailable: ${err instanceof Error ? err.message : String(err)}`,
     );
-    poller = startPollingWatcher();
   }
+  // Poll regardless: inotify never fires for files written over an NFS mount,
+  // so an NFS inbox would silently drop every upload. Intake already dedupes
+  // concurrent event/poll/scan claims on the same basename.
+  poller = startPollingWatcher();
+  log('✅ polling watcher started (2s interval — covers NFS inboxes)');
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
