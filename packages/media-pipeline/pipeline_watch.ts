@@ -85,9 +85,13 @@ const WAIT_STABLE_POLL_MS = Math.max(
   250,
   Number.parseInt(process.env.WAIT_STABLE_POLL_MS || '2000', 10) || 2000,
 );
+// Size-only stability is all a poll can prove — on NFS there is no close_write
+// signal and no way to see remote writers' open files. 3 idle polls (~6s)
+// narrows the paused-writer window; the airtight path for writers is to stage
+// the file and `mv` it into the inbox (atomic publish).
 const WAIT_STABLE_IDLE_POLLS = Math.max(
   1,
-  Number.parseInt(process.env.WAIT_STABLE_IDLE_POLLS || '1', 10) || 1,
+  Number.parseInt(process.env.WAIT_STABLE_IDLE_POLLS || '3', 10) || 3,
 );
 const VMP_API_BASE_URL = (process.env.VMP_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const VMP_API_PIPELINE_SECRET = (process.env.VMP_API_PIPELINE_SECRET || '').trim();

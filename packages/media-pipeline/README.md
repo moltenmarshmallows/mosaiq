@@ -56,7 +56,7 @@ The pipeline asks the worker registry (`workerRegistry.ts`, Redis-backed heartbe
 
 ### Intake
 
-- **Watchfolders** — `INBOX_FAST_LANE_DIR` → fast-lane (720p preview first, then ladder), `INBOX_FULL_LADDER_DIR` → ladder only.
+- **Watchfolders** — `INBOX_FAST_LANE_DIR` → fast-lane (720p preview first, then ladder), `INBOX_FULL_LADDER_DIR` → ladder only. Watched via inotify plus a 2s poller (the only signal on NFS mounts, where inotify never fires). Writers should stage uploads to a sibling path on the same mount and `mv` them into the inbox — that's an atomic publish. Direct creates are accepted only after the size is stable for `WAIT_STABLE_IDLE_POLLS` × `WAIT_STABLE_POLL_MS` (default ~6s); on NFS there is no way to detect a remote writer that has merely paused, so a size check alone cannot prove a file is complete.
 - **TUS resumable uploads** — `tusd` accepts uploads; the supervisor proxies `/vmp/uploads` (dashboard-secret auth) and `tusd`'s post-finish hook moves completed files into the same inboxes. `meta_data.pipelineMode=full_ladder|fast_lane`, optional `meta_data.videoId`. Clients upload with any tus client to `POST {supervisor}/vmp/uploads` + Bearer dashboard secret.
 - **Remote uploads (B2 hop)** — admins upload browser-direct to B2 at `videos/{id}/source.{ext}` via `@vmp/api` multipart presigning (`POST /api/admin/videos/uploads…`). On completion the API calls `POST /vmp/api/ingest` (HMAC, `VMP_WEBHOOK_SECRET`); the supervisor fetches the file **through the API's `/api/video-proxy`** — B2→Cloudflare egress is free, so testing costs nothing — and drops it into the inbox like a NAS drop. The raw MP4 is playable via the same proxy while HLS encodes; the `fully_processed` callback deletes it.
 

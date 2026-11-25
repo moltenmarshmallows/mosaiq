@@ -99,6 +99,8 @@ heartbeat_loop() {
 
 WORKER_PID_FILE="${WORKER_PID_FILE:-/tmp/encore-worker.pid}"
 WORKER_OK_FILE="${WORKER_OK_FILE:-/tmp/encore-worker.ok}"
+# Drop a marker left by an earlier run before the first heartbeat.
+rm -f "$WORKER_OK_FILE"
 heartbeat_loop &
 
 worker_pid=""
