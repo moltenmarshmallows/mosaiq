@@ -32,16 +32,17 @@ networks:
 
 services:
   redis:
-    image: redis:8.10-alpine
+    # encore-web requires RediSearch (FT.*) at boot — stock redis:* images
+    # crash it with `ERR unknown command 'FT._LIST'`. Redis Stack ships the
+    # module; server args go through REDIS_ARGS because a `command:` override
+    # would bypass the stack module loader entirely.
+    image: redis/redis-stack-server:latest
     restart: unless-stopped
     networks: [vmp-media]
     environment:
       VMP_REDIS_PASSWORD: ${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD in .env}
-    # requirepass is mandatory: remote workers reach this port over LAN.
-    command:
-      - sh
-      - -c
-      - exec redis-server --appendonly yes --requirepass "$${VMP_REDIS_PASSWORD}"
+      # requirepass is mandatory: remote workers reach this port over LAN.
+      REDIS_ARGS: --appendonly yes --requirepass ${VMP_REDIS_PASSWORD:?Set VMP_REDIS_PASSWORD in .env}
     volumes:
       - redis-data:/data
     ports:
