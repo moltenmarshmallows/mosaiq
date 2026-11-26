@@ -2,12 +2,13 @@ name: vmp-480p-gpu-nvenc
 description: VMP phase-2 — 480p H.264 via NVENC (worker GPU required)
 scaling: bicubic
 encodes:
-  - type: X264Encode
+  - type: VideoEncode
+    codec: h264_nvenc
+    format: mp4
     suffix: _480p
     height: 480
     twoPass: false
     params:
-      c:v: h264_nvenc
       b:v: 1500k
       maxrate: 1500k
       bufsize: 3000k
