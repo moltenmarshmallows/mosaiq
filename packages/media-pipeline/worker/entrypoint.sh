@@ -54,6 +54,38 @@ detect_backend() {
 
 GPU_BACKEND="$(detect_backend)"
 
+# SheepIt-style warmup: one fixed 150-frame 720p encode on the detected
+# backend, wall-clocked. fps lands in the heartbeat as speedFactor so the
+# supervisor can rank workers (Encore itself routes by queue, not speed —
+# this is ranking/capacity data, not per-job steering).
+BENCH_MS=""
+if [ "${VMP_SKIP_BENCHMARK:-0}" != "1" ]; then
+  t0=$(date +%s%N)
+  ok=1
+  case "$GPU_BACKEND" in
+    nvenc)
+      "$FFMPEG" -hide_banner -loglevel error -init_hw_device cuda=0 \
+        -f lavfi -i testsrc2=size=1280x720:rate=30 -frames:v 150 \
+        -filter_hw_device cuda -vf 'format=nv12,hwupload' \
+        -c:v h264_nvenc -f null - || ok=0 ;;
+    vaapi)
+      "$FFMPEG" -hide_banner -loglevel error \
+        -init_hw_device "vaapi=va:$VAAPI_DEVICE" -filter_hw_device va \
+        -f lavfi -i testsrc2=size=1280x720:rate=30 -frames:v 150 \
+        -vf 'format=nv12,hwupload' -c:v h264_vaapi -f null - || ok=0 ;;
+    *)
+      "$FFMPEG" -hide_banner -loglevel error \
+        -f lavfi -i testsrc2=size=1280x720:rate=30 -frames:v 150 \
+        -c:v libx264 -preset veryfast -f null - || ok=0 ;;
+  esac
+  if [ "$ok" = 1 ]; then
+    BENCH_MS=$(( ($(date +%s%N) - t0) / 1000000 ))
+    echo "benchmark: 150 frames in ${BENCH_MS}ms (~$((150000 / (BENCH_MS > 0 ? BENCH_MS : 1))) fps)" >&2
+  else
+    echo "benchmark: encode failed — reporting no speedFactor" >&2
+  fi
+fi
+
 # Capability class routing (see encorePriorities.ts): prio>=50 jobs sit in queue
 # 0. A worker polling queue 1 with higher-prio drains 0→1. CPU workers pin to
 # queue 1 only, so GPU-profile jobs can never land on a CPU-only box.
@@ -86,7 +118,9 @@ heartbeat_loop() {
         --arg version "${VMP_WORKER_VERSION:-docker}" \
         --argjson pollQueue "$ENCORE_SETTINGS_POLL_QUEUE" \
         --argjson pollHigherPrio "$ENCORE_SETTINGS_POLL_HIGHER_PRIO" \
-        '{workerId:$workerId,hostname:$hostname,gpuBackend:$gpuBackend,pollQueue:$pollQueue,pollHigherPrio:$pollHigherPrio,version:$version}') \
+        --argjson benchMs "${BENCH_MS:-null}" \
+        '{workerId:$workerId,hostname:$hostname,gpuBackend:$gpuBackend,pollQueue:$pollQueue,pollHigherPrio:$pollHigherPrio,version:$version}
+         + (if ($benchMs|type) == "number" and $benchMs > 0 then {speedFactor: ((150000/$benchMs*10|round)/10)} else {} end)') \
         || { echo "heartbeat: payload encode failed" >&2; sleep "$HEARTBEAT_S"; continue; }
       curl -sf -m 5 -X POST "$SUPERVISOR_URL/api/workers/heartbeat" \
         -H "x-vmp-worker-token: $VMP_WORKER_TOKEN" -H 'content-type: application/json' \

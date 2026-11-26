@@ -1348,11 +1348,12 @@ function dashboardHtml() {
         document.getElementById('ttp').innerHTML = '<table><thead><tr><th>Video</th><th>Minimal (720p)</th><th>Full renditions</th><th>Ratio minimal</th><th>Ratio full</th><th>At</th></tr></thead><tbody>' + ttpRows + '</tbody></table>'
         const workerRows = (d.workers || []).map(w =>
           '<tr><td>' + escapeHtml(w.hostname || w.workerId || '') + '</td><td>' + escapeHtml(w.gpuBackend || '') +
-          '</td><td>' + escapeHtml(String(w.pollQueue ?? '')) + '</td><td>' + escapeHtml(w.version || '—') +
+          '</td><td>' + escapeHtml(String(w.pollQueue ?? '')) + '</td><td>' +
+          escapeHtml(w.speedFactor != null ? String(w.speedFactor) + ' fps' : '—') + '</td><td>' + escapeHtml(w.version || '—') +
           '</td><td>' + escapeHtml(w.lastSeenAt || '') + '</td></tr>'
         ).join('')
         document.getElementById('workers').innerHTML = workerRows
-          ? '<table><thead><tr><th>Worker</th><th>Backend</th><th>Poll queue</th><th>Version</th><th>Last heartbeat</th></tr></thead><tbody>' + workerRows + '</tbody></table>'
+          ? '<table><thead><tr><th>Worker</th><th>Backend</th><th>Poll queue</th><th>Bench fps</th><th>Version</th><th>Last heartbeat</th></tr></thead><tbody>' + workerRows + '</tbody></table>'
           : '<p>No live workers — jobs will queue until a worker compose registers.</p>'
         document.getElementById('log').textContent = (d.logLines || []).join('\\n')
       } catch (e) {
@@ -1813,6 +1814,7 @@ const server = http.createServer(async (req, res) => {
       pollQueue?: number;
       pollHigherPrio?: boolean;
       version?: string;
+      speedFactor?: number;
     } | null;
     const workerId = String(body?.workerId || '').trim();
     const gpuBackend = String(body?.gpuBackend || '').trim() as WorkerGpuBackend;
@@ -1825,7 +1827,12 @@ const server = http.createServer(async (req, res) => {
       pollQueue > 16 ||
       // Reject rather than coerce a malformed capability — a truthy string
       // would silently register a worker as higher-prio-capable.
-      (body?.pollHigherPrio !== undefined && typeof body.pollHigherPrio !== 'boolean')
+      (body?.pollHigherPrio !== undefined && typeof body.pollHigherPrio !== 'boolean') ||
+      (body?.speedFactor !== undefined &&
+        (typeof body.speedFactor !== 'number' ||
+          !Number.isFinite(body.speedFactor) ||
+          body.speedFactor <= 0 ||
+          body.speedFactor > 100_000))
     ) {
       json(res, { error: 'Invalid worker heartbeat' }, 400);
       return;
@@ -1838,6 +1845,7 @@ const server = http.createServer(async (req, res) => {
       pollHigherPrio:
         typeof body?.pollHigherPrio === 'boolean' ? body.pollHigherPrio : undefined,
       version: body?.version ? String(body.version).slice(0, 64) : undefined,
+      speedFactor: body?.speedFactor,
     });
     json(res, { ok: true, worker: record });
     return;
