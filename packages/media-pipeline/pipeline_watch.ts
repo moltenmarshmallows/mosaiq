@@ -191,6 +191,10 @@ async function rmTmpJobDir(tmpDir: string): Promise<void> {
  */
 const cleanupChains = new Map<string, Promise<void>>();
 
+/** videoIds with a live processVideo — the run's lifetime, regardless of
+ * whether it has created its job handle yet. */
+const activeRuns = new Set<string>();
+
 function chainCleanup(videoId: string, task: () => Promise<unknown>): Promise<void> {
   const prev = cleanupChains.get(videoId) ?? Promise.resolve();
   const next = prev
@@ -238,11 +242,16 @@ async function cleanupCancelledJob(
   lockFile: string,
   inputPath?: string,
 ): Promise<void> {
-  await cleanupJobArtifacts(videoId, lockFile, inputPath);
-  videoDurations.delete(videoId);
-  progressEmitState.delete(videoId);
-  jobHandles.delete(videoId);
-  stoppedVideos.delete(videoId);
+  try {
+    await cleanupJobArtifacts(videoId, lockFile, inputPath);
+  } finally {
+    // State teardown must happen even when the filesystem cleanup rejects —
+    // skipping it wedges the id (stale stopped flag/handle blocks re-drops).
+    videoDurations.delete(videoId);
+    progressEmitState.delete(videoId);
+    jobHandles.delete(videoId);
+    stoppedVideos.delete(videoId);
+  }
 }
 
 export function pauseJob(videoId: string): void {
@@ -703,6 +712,25 @@ async function processVideo(
   const tmpDir = path.join(TMP_DIR_BASE, videoId);
   const doneFlag = path.join(tmpDir, '.done');
   const lockFile = path.join(tmpDir, '.lock');
+  activeRuns.add(videoId);
+  try {
+    await processVideoBody(videoId, inputPath, tmpDir, doneFlag, lockFile, jobStartMs, source, pipelineMode);
+    return;
+  } finally {
+    activeRuns.delete(videoId);
+  }
+}
+
+async function processVideoBody(
+  videoId: string,
+  inputPath: string,
+  tmpDir: string,
+  doneFlag: string,
+  lockFile: string,
+  jobStartMs: number,
+  source: string,
+  pipelineMode: PipelineMode,
+): Promise<void> {
   let cancelled = false;
   if (isJobStopped(videoId)) return;
   // A previous run's cleanup may still be retrying rm(tmpDir) — don't create
@@ -1000,7 +1028,7 @@ async function handleIpcCommand(raw: string): Promise<{ ok: boolean; error?: str
     void stopJob(videoId).catch((err) => {
       log(`stop ${videoId} cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
       terminalVideoIds.delete(videoId);
-      if (jobHandles.get(videoId)) return;
+      if (activeRuns.has(videoId)) return;
       stoppedVideos.delete(videoId);
       enqueuedVideoIds.delete(videoId);
     });
