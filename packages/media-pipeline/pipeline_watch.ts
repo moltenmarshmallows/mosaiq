@@ -182,21 +182,55 @@ async function rmTmpJobDir(tmpDir: string): Promise<void> {
   await rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
 }
 
+/**
+ * Per-videoId serialization of filesystem cleanup: a fire-and-forget stop can
+ * still be retrying rm(tmpDir) while a same-id re-run tries to create it.
+ * Every cleanup joins the id's chain; a new run awaits the chain before it
+ * creates tmpDir. A rejected earlier link must not block later work — only
+ * settled-ness matters for ordering.
+ */
+const cleanupChains = new Map<string, Promise<void>>();
+
+function chainCleanup(videoId: string, task: () => Promise<unknown>): Promise<void> {
+  const prev = cleanupChains.get(videoId) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(task)
+    .then(() => undefined);
+  cleanupChains.set(videoId, next);
+  return next;
+}
+
+/**
+ * First writer wins the terminal state — stop vs success each try to claim
+ * the transition and only the winner emits its terminal event, so `done` can
+ * never overtake a `stopped` that won during the rm retry window.
+ */
+const terminalVideoIds = new Map<string, 'stopped' | 'done'>();
+
+function claimTerminal(videoId: string, state: 'stopped' | 'done'): boolean {
+  if (terminalVideoIds.has(videoId)) return false;
+  terminalVideoIds.set(videoId, state);
+  return true;
+}
+
 async function cleanupJobArtifacts(
   videoId: string,
   lockFile?: string,
   inputPath?: string,
 ): Promise<void> {
-  const tmpDir = path.join(TMP_DIR_BASE, videoId);
-  await rmTmpJobDir(tmpDir);
+  return chainCleanup(videoId, async () => {
+    const tmpDir = path.join(TMP_DIR_BASE, videoId);
+    await rmTmpJobDir(tmpDir);
 
-  const inboxPath = inputPath;
-  if (inboxPath) {
-    await rm(inboxPath, { force: true });
-    jobInputPaths.delete(videoId);
-  }
+    const inboxPath = inputPath;
+    if (inboxPath) {
+      await rm(inboxPath, { force: true });
+      jobInputPaths.delete(videoId);
+    }
 
-  if (lockFile) await rm(lockFile, { force: true });
+    if (lockFile) await rm(lockFile, { force: true });
+  });
 }
 
 async function cleanupCancelledJob(
@@ -264,6 +298,10 @@ async function waitForChildrenExit(children: Set<ChildProcess>, timeoutMs: numbe
 }
 
 export async function stopJob(videoId: string): Promise<void> {
+  // First writer wins: if success already claimed the terminal transition the
+  // stop is a no-op (the job is done, not stopped); a duplicate stop likewise
+  // yields to the in-flight cleanup instead of double-emitting.
+  if (!claimTerminal(videoId, 'stopped')) return;
   stoppedVideos.add(videoId);
   removeQueuedJobs(videoId);
   const handle = jobHandles.get(videoId);
@@ -568,18 +606,26 @@ async function completePipelineSuccess(
 ): Promise<void> {
   emitPipelineEvent(videoId, 'cleanup', 'active', 'start');
   await writeFile(doneFlag, 'done');
-  await rm(inputPath, { force: true });
-  jobInputPaths.delete(videoId);
-  await rmTmpJobDir(tmpDir);
-  emitPipelineEvent(videoId, 'done', 'success', 'watchfolder_and_tmp_cleared');
-  emitProgressCheckpoint(videoId, 'done', PROGRESS.DONE, 'complete');
-  await emitTtp(videoId, 'pipeline_done', {});
-  await emitTtpSummary(videoId, 'success');
-  histogram('vmp.transcoder.job.duration_ms', Date.now() - jobStartMs, {
-    outcome: 'success',
-    source,
+  await chainCleanup(videoId, async () => {
+    await rm(inputPath, { force: true });
+    jobInputPaths.delete(videoId);
+    await rmTmpJobDir(tmpDir);
   });
-  increment('vmp.transcoder.job.success', 1, { source });
+  // A stop claiming the terminal transition during the rm window means it
+  // emitted 'stopped' already — 'done' must not overtake it. The bookkeeping
+  // below runs either way: losing the claim must not wedge the id's
+  // admission/state for a later re-drop.
+  if (claimTerminal(videoId, 'done')) {
+    emitPipelineEvent(videoId, 'done', 'success', 'watchfolder_and_tmp_cleared');
+    emitProgressCheckpoint(videoId, 'done', PROGRESS.DONE, 'complete');
+    await emitTtp(videoId, 'pipeline_done', {});
+    await emitTtpSummary(videoId, 'success');
+    histogram('vmp.transcoder.job.duration_ms', Date.now() - jobStartMs, {
+      outcome: 'success',
+      source,
+    });
+    increment('vmp.transcoder.job.success', 1, { source });
+  }
   videoDurations.delete(videoId);
   progressEmitState.delete(videoId);
   jobHandles.delete(videoId);
@@ -659,6 +705,10 @@ async function processVideo(
   const lockFile = path.join(tmpDir, '.lock');
   let cancelled = false;
   if (isJobStopped(videoId)) return;
+  // A previous run's cleanup may still be retrying rm(tmpDir) — don't create
+  // files inside a removal that's in flight. Settled-ness only: a failed
+  // earlier cleanup must not block the new run.
+  await (cleanupChains.get(videoId) ?? Promise.resolve()).catch(() => {});
   await mkdir(tmpDir, { recursive: true });
   if (existsSync(doneFlag)) {
     emitPipelineEvent(videoId, 'done', 'success', 'already_done');
@@ -775,6 +825,9 @@ function maybeEnqueueOnce(
 ): void {
   if (enqueuedVideoIds.has(videoId)) return;
   enqueuedVideoIds.add(videoId);
+  // A re-drop is a new run — it needs its own terminal slot or a stale
+  // 'stopped'/'done' claim would silence its terminal event (and stop).
+  terminalVideoIds.delete(videoId);
   enqueue(videoId, inputPath, source, pipelineMode);
 }
 
@@ -939,10 +992,17 @@ async function handleIpcCommand(raw: string): Promise<{ ok: boolean; error?: str
   if (cmd === 'stop') {
     if (!videoId) return { ok: false, error: 'missing_videoId' };
     // Fire-and-forget needs a catch — a cleanup rejection here would be an
-    // unhandled rejection and kill the whole pipeline process.
-    void stopJob(videoId).catch((err) =>
-      log(`stop ${videoId} cleanup failed: ${err instanceof Error ? err.message : String(err)}`),
-    );
+    // unhandled rejection and kill the whole pipeline process. On failure the
+    // id is fully unwired (stopped flag, stale 'stopping' handle, admission
+    // gate, terminal claim) so a re-drop can start a fresh run — its cleanup
+    // re-attempts the removal through the per-id chain.
+    void stopJob(videoId).catch((err) => {
+      log(`stop ${videoId} cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+      stoppedVideos.delete(videoId);
+      terminalVideoIds.delete(videoId);
+      jobHandles.delete(videoId);
+      enqueuedVideoIds.delete(videoId);
+    });
     return { ok: true };
   }
   if (cmd === 'reorder') {
