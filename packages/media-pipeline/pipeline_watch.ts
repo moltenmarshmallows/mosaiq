@@ -177,7 +177,9 @@ async function rmTmpJobDir(tmpDir: string): Promise<void> {
     log(`refusing to remove non-job directory '${target}' (TMP_DIR_BASE=${base})`);
     return;
   }
-  await rm(tmpDir, { recursive: true, force: true });
+  // NFS silly-renames open files to .nfs* during delete — rmdir hits
+  // ENOTEMPTY until the holder closes them. Retries cover the window.
+  await rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
 }
 
 async function cleanupJobArtifacts(
@@ -936,7 +938,11 @@ async function handleIpcCommand(raw: string): Promise<{ ok: boolean; error?: str
   }
   if (cmd === 'stop') {
     if (!videoId) return { ok: false, error: 'missing_videoId' };
-    void stopJob(videoId);
+    // Fire-and-forget needs a catch — a cleanup rejection here would be an
+    // unhandled rejection and kill the whole pipeline process.
+    void stopJob(videoId).catch((err) =>
+      log(`stop ${videoId} cleanup failed: ${err instanceof Error ? err.message : String(err)}`),
+    );
     return { ok: true };
   }
   if (cmd === 'reorder') {
