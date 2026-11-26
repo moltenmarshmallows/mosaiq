@@ -992,15 +992,16 @@ async function handleIpcCommand(raw: string): Promise<{ ok: boolean; error?: str
   if (cmd === 'stop') {
     if (!videoId) return { ok: false, error: 'missing_videoId' };
     // Fire-and-forget needs a catch — a cleanup rejection here would be an
-    // unhandled rejection and kill the whole pipeline process. On failure the
-    // id is fully unwired (stopped flag, stale 'stopping' handle, admission
-    // gate, terminal claim) so a re-drop can start a fresh run — its cleanup
-    // re-attempts the removal through the per-id chain.
+    // unhandled rejection and kill the whole pipeline process. If the run is
+    // still unwinding, keep the stop guard: its cancelled-path finally clears
+    // stoppedVideos/jobHandles/enqueuedVideoIds when it exits, and clearing
+    // them early would let the dead run resurrect or a new admission overlap
+    // the old run's teardown. Only when nothing is active do we unwire here.
     void stopJob(videoId).catch((err) => {
       log(`stop ${videoId} cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
-      stoppedVideos.delete(videoId);
       terminalVideoIds.delete(videoId);
-      jobHandles.delete(videoId);
+      if (jobHandles.get(videoId)) return;
+      stoppedVideos.delete(videoId);
       enqueuedVideoIds.delete(videoId);
     });
     return { ok: true };
