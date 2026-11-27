@@ -38,6 +38,7 @@ x-worker-env: &worker-env
   VMP_SUPERVISOR_URL: ${VMP_SUPERVISOR_URL:-http://${VMP_COORDINATOR:-vmp-supervisor}:8788}
   VMP_WORKER_TOKEN: ${VMP_WORKER_TOKEN:?Set VMP_WORKER_TOKEN in .env (shared with coordinator)}
   VMP_WORKER_HEARTBEAT_S: ${VMP_WORKER_HEARTBEAT_S:-30}
+  VMP_SKIP_BENCHMARK: ${VMP_SKIP_BENCHMARK:-0}
   ENCORE_WORKER_IDLE_SLEEP_S: ${ENCORE_WORKER_IDLE_SLEEP_S:-5}
   VMP_WORKER_VERSION: ${VMP_WORKER_VERSION:-docker}
   # Optional: pin the registry identity / force a backend for testing.

@@ -28,6 +28,12 @@ export type WorkerRecord = {
   pollHigherPrio?: boolean;
   /** Worker image / entrypoint version tag, free-form. */
   version?: string;
+  /**
+   * Measured fps of a fixed 150-frame 720p startup encode on the worker's
+   * backend — relative capacity ranking, not a per-job guarantee. Absent on
+   * workers predating the benchmark or whose warmup encode failed.
+   */
+  speedFactor?: number;
   firstSeenAt: string;
   lastSeenAt: string;
 };
