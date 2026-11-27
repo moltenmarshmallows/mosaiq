@@ -718,6 +718,17 @@ async function processVideo(
     return;
   } finally {
     activeRuns.delete(videoId);
+    // A stopped run that exits before processVideoBody's cancelled-path
+    // teardown (the isJobStopped early return — a stop landing between dequeue
+    // and start) never unwires its guard or admission gate: the id becomes a
+    // permanent tombstone. Runs that reached the teardown already cleared
+    // these, so isJobStopped is false and this is a no-op for them — and for
+    // already_done/skip early returns the guard is unset anyway.
+    if (isJobStopped(videoId)) {
+      stoppedVideos.delete(videoId);
+      jobHandles.delete(videoId);
+      enqueuedVideoIds.delete(videoId);
+    }
   }
 }
 
